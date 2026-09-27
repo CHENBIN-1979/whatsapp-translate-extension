@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 320px;
+      margin: 0;
+      padding: 14px 16px 16px;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 13px;
+      color: #1f2937;
+      background: #f8fafc;
+    }
+    h1 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 6px; }
+    h1 .dot { width: 9px; height: 9px; border-radius: 50%; background: #25d366; display: inline-block; }
+    .field { margin-bottom: 9px; }
+    label { display: block; margin-bottom: 3px; color: #64748b; font-size: 12px; }
+    input[type=text], input[type=password], input[type=number], select {
+      width: 100%; box-sizing: border-box; padding: 6px 8px;
+      border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12.5px; background: #fff;
+    }
+    input:focus, select:focus { outline: 2px solid #5865f255; border-color: #5865f2; }
+    .row { display: flex; gap: 8px; }
+    .row .field { flex: 1; }
+    .switch-line { display: flex; align-items: center; justify-content: space-between; margin: 10px 0; }
+    button {
+      border: none; border-radius: 6px; padding: 7px 12px; font-size: 12.5px;
+      cursor: pointer; background: #5865f2; color: #fff;
+    }
+    button.secondary { background: #e2e8f0; color: #334155; }
+    .btns { display: flex; gap: 8px; margin-top: 4px; }
+    .btns button { flex: 1; }
+    #status { margin-top: 10px; padding: 7px 9px; border-radius: 6px; font-size: 12px; display: none; white-space: pre-wrap; word-break: break-word; }
+    #status.ok { display: block; background: #dcfce7; color: #166534; }
+    #status.err { display: block; background: #fee2e2; color: #991b1b; }
+    #status.busy { display: block; background: #e0e7ff; color: #3730a3; }
+    .hint { color: #94a3b8; font-size: 11px; margin-top: 8px; line-height: 1.5; }
+    .profile-bar { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+    .profile-bar select { flex: 1; }
+    .profile-bar button { padding: 5px 8px; font-size: 12px; }
+    #delProfile { background: #fee2e2; color: #991b1b; }
+    .stats { color: #94a3b8; font-size: 11px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h1><span class="dot"></span>WhatsApp 实时翻译</h1>
+
+  <div class="switch-line">
+    <label for="enabled" style="margin:0;font-size:13px;color:#1f2937">启用自动翻译</label>
+    <input type="checkbox" id="enabled" checked>
+  </div>
+  <div style="display:flex;align-items:center;gap:6px;margin:2px 0 8px">
+    <label for="fast" style="margin:0;font-size:13px;color:#1f2937">极速模式（关闭模型思考链，实测约快一倍）</label>
+    <input type="checkbox" id="fast" checked>
+  </div>
+
+  <div class="field">
+    <label>模型配置（可存多套；下拉选中的那条 = 翻译实时使用，无需保存）</label>
+    <div class="profile-bar">
+      <select id="profileSel" title="切换后翻译立即使用该配置"></select>
+      <button id="addProfile" class="secondary" title="以当前表单新建一条配置">＋ 新增</button>
+      <button id="delProfile" title="删除当前配置">删</button>
+    </div>
+  </div>
+  <div class="row">
+    <div class="field">
+      <label>配置名称</label>
+      <input type="text" id="pName" placeholder="如：scnet Qwen">
+    </div>
+  </div>
+  <div class="field">
+    <label>API Base URL（OpenAI 兼容）</label>
+    <input type="text" id="apiBase" placeholder="https://api.scnet.cn/api/llm/v1">
+  </div>
+  <div class="field">
+    <label>API Key</label>
+    <input type="password" id="apiKey" placeholder="sk-...">
+  </div>
+  <div class="row">
+    <div class="field">
+      <label>模型</label>
+      <input type="text" id="model" placeholder="Qwen3.8-Flash">
+    </div>
+    <div class="field" style="max-width:80px">
+      <label>Temperature</label>
+      <input type="number" id="temperature" min="0" max="2" step="0.1">
+    </div>
+  </div>
+
+  <details id="dictBox" style="margin:8px 0">
+    <summary style="cursor:pointer;font-size:13px;color:#1f2937;padding:2px 0">专属词典（厂内术语，点展开）</summary>
+    <div class="field" style="margin-top:6px">
+      <label>每行一个术语：<b>印尼文 = 中文</b>（冒号也可）。双向自动生效</label>
+      <textarea id="customDict" rows="5" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:12.5px;font-family:inherit;resize:vertical;background:#fff" placeholder="calender = 压延机&#10;emboss = 压花辊&#10;bahan baku = 原材料"></textarea>
+      <div class="hint" style="margin-top:2px">词典里的术语：对方印尼文消息→强制译成你写的中文；你打中文→强制译回印尼术语。改词典后旧译文自动重译。</div>
+    </div>
+    <div class="btns"><button id="saveDict" class="secondary" style="flex:1">保存词典（立即生效）</button></div>
+  </details>
+
+  <div class="btns">
+    <button id="save">保存</button>
+    <button id="test" class="secondary">测试连接</button>
+    <button id="diagnose" class="secondary">诊断</button>
+  </div>
+
+  <div id="status"></div>
+  <div class="stats" id="stats"></div>
+  <div class="hint">
+    译文显示在消息气泡下方：对方语言 → 中文，你的中文 → 印尼语。<br>
+    「＋ 新增」把当前表单存为新配置；下拉框随时切换，翻译立即用选中的模型。<br>
+    输入框右下角「译」按钮 = 反向翻译，再点一次还原原文。<br>
+    Key 仅保存在本机浏览器（chrome.storage.local），不上传任何地方。
+  </div>
+  <div class="btns"><button id="clearCache" class="secondary">清空翻译缓存</button></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

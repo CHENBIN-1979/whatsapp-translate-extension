@@ -1,0 +1,3 @@
+# 构建产物与打包交付物（本地保留，不入库）
+*.zip
+whatsapp-translate-extension/

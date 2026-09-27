@@ -1,0 +1,106 @@
+/* content.css — WhatsApp 实时翻译注入样式 */
+
+.wtrans-row {
+  display: block;
+  margin: 4px 0 2px 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(88, 101, 242, 0.09);
+  font-size: 15px;
+  line-height: 1.5;
+  width: fit-content;
+  max-width: 100%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.wtrans-out {
+  background: rgba(37, 211, 102, 0.10);
+}
+
+.wtrans-tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #5865f2;
+  background: rgba(88, 101, 242, 0.16);
+  vertical-align: middle;
+  user-select: none;
+}
+
+.wtrans-out .wtrans-tag {
+  color: #128c7e;
+  background: rgba(18, 140, 126, 0.14);
+}
+
+.wtrans-body {
+  color: #25d366; /* v1.1.6 用户要求绿色（WhatsApp 品牌绿，深色/浅色主题均可读） */
+}
+
+.wtrans-failed .wtrans-body {
+  color: #e542a3d9;
+  cursor: pointer;
+}
+
+/* 输入框反向翻译按钮 */
+.wtrans-compose-btn {
+  position: absolute;
+  right: 58px;
+  bottom: 12px;
+  z-index: 999;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: #5865f2;
+  background: rgba(88, 101, 242, 0.14);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s, transform 0.1s;
+}
+
+.wtrans-compose-btn:hover {
+  background: rgba(88, 101, 242, 0.28);
+  transform: scale(1.08);
+}
+
+.wtrans-compose-btn.wtrans-active {
+  color: #ffffff;
+  background: #5865f2;
+}
+
+.wtrans-compose-btn.wtrans-busy {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.wtrans-ver { margin-left: 4px; font-size: 10px; opacity: .55; font-weight: 400; }
+
+/* v1.1.19 ⟳ 刷新按钮：译文行水印右侧，点击强制重译该条（清缓存） */
+.wtrans-refresh {
+  display: inline-block;
+  margin: 0 6px 0 2px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1.4;
+  color: #25d366;
+  cursor: pointer;
+  user-select: none;
+  opacity: 0.85;
+  transition: background 0.15s, transform 0.15s;
+}
+
+.wtrans-refresh:hover {
+  background: rgba(37, 211, 102, 0.18);
+  transform: rotate(90deg);
+  opacity: 1;
+}
+
+.wtrans-row .wtrans-ver { margin-right: 2px; }

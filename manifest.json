@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "WhatsApp 实时翻译（中印互译）",
+  "version": "1.1.21",
+  "description": "WhatsApp 网页版实时互译：印尼语↔中文。基于 OpenAI 兼容 LLM API。译文显示在消息气泡下方，输入框支持反向翻译。",
+  "permissions": ["storage"],
+  "host_permissions": ["https://web.whatsapp.com/*", "https://api.scnet.cn/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "WhatsApp 实时翻译",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
