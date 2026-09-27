@@ -58,4 +58,5 @@ WhatsApp 前端类名是混淆的、会定期变。v1.1.2 起扫描器自带三�
 
 ## 版本更新记录
 
-完整版本更新记录（v1.1.4 → v1.1.21）与安装包归档见 [Releases 页面](https://github.com/CHENBIN-1979/whatsapp-translate-extension/releases)。
+- 各版本简短更新/修复条目 + 安装包归档：[Releases 页面](https://github.com/CHENBIN-1979/whatsapp-translate-extension/releases)（v1.1.4 → v1.1.21 逐版本）
+- 根因说明与实测细节（"为什么这么改"）：[CHANGELOG.md](CHANGELOG.md)
