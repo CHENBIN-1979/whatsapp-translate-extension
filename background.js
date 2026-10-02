@@ -8,6 +8,14 @@
  *          （scnet Qwen3.8-Flash 实测单条翻译 7.3s→3.6s）；网关若不认识该参数
  *          （400/422）自动剥字段重试并记住不再发送。弹窗可开关。
  * v1.1.8：用户专属词典（术语表注入提示词 + 输出整词硬替换），词典变更自动清缓存。
+ * v1.1.22：content 端改「点击翻译」模式（后台逻辑不变，仍接收 wtranslate 批量/单条请求）。
+ * v1.1.23：词典升级——例句（术语=译文 | 例句原文=例句译文，例句注入提示词）；
+ *          注入模式 dictMode=auto（只注入当前句命中的词条，默认）/all（全词典）；
+ *          缓存指纹含模式+例句；新增环形运行日志 wtrans_log_v1（150 条，供排障导出）。
+ * v1.1.24：原文回显不再当失败（人名/型号保留原文=正常）→ 正常入缓存，content 端加
+ *          「专有名词」标注，重复点击零计费（修复用户日志：同一人名点 4 次计 4 次费）；
+ *          系统提示词强化人名音译规则；例句改为独立框（customDictEx 单独编辑，
+ *          格式「印尼文 = 中文」逐行）；dictMode 下拉改开关（开=全词典/关=自动匹配）。
  */
 const DEFAULTS = {
   apiBase: 'https://api.scnet.cn/api/llm/v1',
@@ -17,6 +25,9 @@ const DEFAULTS = {
   temperature: 0.2,
   fast: true,   // v1.1.5 极速模式：关思考型模型(qwen等)的思维链，实测翻译 7.3s→3.6s
   customDict: {}, // v1.1.8 用户专属词典 {印尼术语: 指定译文}（键存小写）
+  customDictEx: {}, // v1.1.23 词典例句 {术语: [印尼例句, 中文例句]}
+  dictMode: 'auto', // v1.1.23 注入模式：auto=只注入当前句命中的词条（推荐）/ all=全词典注入
+  transFontSize: 15, // v1.1.23 译文字号 px（content.js 应用，background 只存储）
   profiles: null,      // v1.1.20 多模型配置列表 [{id,name,apiBase,apiKey,model,temperature}]；null=未设置，走旧单配置
   activeProfile: '',   // v1.1.20 当前启用的配置 id；翻译实时用这一条
 };
@@ -25,6 +36,39 @@ const DEFAULTS = {
 const CACHE_KEY = 'wtrans_' + 'cache_v2'; // v1.1.10：v2 作废旧算法/旧提示词产生的错误译文
 const CACHE_MAX = 2000;
 let cache = null; // Map<string,string>，key = lang|text
+
+// ---------------- v1.1.23 运行日志（环形 150 条，供用户导出排障） ----------------
+const LOG_KEY = 'wtrans_' + 'log_v1'; // v1.1.23 运行日志（弹窗「导出日志」读这个键）
+const LOG_MAX = 150;
+let logBuf = [];
+let logTimer = null;
+let logSaving = null; // 串行化写盘：避免缓冲区刷新与外部写入交错丢日志
+function logLine(level, msg, d) {
+  const rec = { t: Date.now(), lv: level, m: String(msg).slice(0, 200) };
+  if (d) rec.d = String(d).slice(0, 160);
+  logBuf.push(rec);
+  while (logBuf.length > LOG_MAX) logBuf.shift();
+  if (!logTimer) logTimer = setTimeout(flushLog, 1200); // 攒 1.2s 合并写，降低 storage 写频
+}
+function flushLog() {
+  logTimer = null;
+  const items = logBuf.splice(0);
+  if (!items.length) return;
+  logSaving = (logSaving || Promise.resolve()).then(async () => {
+    try {
+      const { [LOG_KEY]: arr } = await chrome.storage.local.get(LOG_KEY);
+      const list = Array.isArray(arr) ? arr : [];
+      list.push(...items);
+      while (list.length > LOG_MAX) list.shift();
+      await chrome.storage.local.set({ [LOG_KEY]: list });
+    } catch {}
+  });
+}
+function fmtT(ts) {
+  const d = new Date(ts);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 
 async function loadCache() {
   if (cache) return cache;
@@ -98,6 +142,82 @@ function dictLinesRev(dict) {
   if (!dict || !dict.size) return '';
   return [...dict.entries()].sort((a, b) => b[1].length - a[1].length)
     .map(([k, v]) => `${v}=${k}`).join('；');
+}
+// ---------------- v1.1.23 例句 + 注入模式 ----------------
+// 例句存储：customDictEx = {印尼术语(小写): [印尼例句, 中文例句]}
+function normDictEx(raw) {
+  const out = new Map();
+  if (raw && typeof raw === 'object') {
+    for (const [k, v] of Object.entries(raw)) {
+      const key = String(k).trim().toLowerCase();
+      const arr = Array.isArray(v) ? v : (typeof v === 'string' ? [v, ''] : null);
+      if (!key || !arr) continue;
+      const idS = String(arr[0] || '').trim();
+      const zhS = String(arr[1] || '').trim();
+      if (idS || zhS) out.set(key, [idS, zhS]);
+    }
+  }
+  return out;
+}
+function exLines(ex, dict) {
+  // 例句 → 提示词示例行（正反两个方向各列一条，模型学整句语境与术语用法）
+  if (!ex || !ex.size) return '';
+  const parts = [];
+  for (const [term, [idS, zhS]] of ex) {
+    if (!idS || !zhS) continue;
+    parts.push(`「${idS}」→「${zhS}」`);
+  }
+  return parts.join('\n');
+}
+function exLinesRev(ex, dict) {
+  if (!ex || !ex.size) return '';
+  const parts = [];
+  for (const [term, [idS, zhS]] of ex) {
+    if (!idS || !zhS) continue;
+    parts.push(`「${zhS}」→「${idS}」`);
+  }
+  return parts.join('\n');
+}
+function matchDictFor(mode, dict, text) {
+  // auto 模式：只挑当前文本命中的词条（术语出现在原文，或指定译文出现在中文原文）。
+  // all 模式：整本词典。硬替换层不受模式影响（本来就按整词命中替换）。
+  if (mode === 'all' || !dict || !dict.size) return dict;
+  const out = new Map();
+  for (const [term, val] of dict) {
+    if (hasTerm(term, text) || hasTerm(val, text)) out.set(term, val);
+  }
+  return out;
+}
+function exHitFor(ex, text) {
+  // v1.1.24：例句独立成框，术语键=印尼文；匹配=例句文本本身出现在当前句
+  // （例句多为设备报障/流程整句，用户点译时整句常就是例句或其子串；术语键单独出现命中率低）
+  const out = new Map();
+  if (!ex || !ex.size) return out;
+  const norm = String(text || '').toLowerCase().replace(/\s+/g, ' ');
+  for (const [term, v] of ex) {
+    const idS = String((v && v[0]) || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const zhS = String((v && v[1]) || '').replace(/\s+/g, '').trim();
+    if (idS && (norm.includes(idS) || (v[0] && hasTerm(v[0], text)))) out.set(term, v);
+    else if (zhS && text.indexOf(zhS) >= 0) out.set(term, v);
+  }
+  return out;
+}
+function matchExFor(mode, ex, matchedDict) {
+  if (mode === 'all' || !ex || !ex.size) return ex;
+  const out = new Map();
+  for (const [term, v] of ex) if (matchedDict.has(term)) out.set(term, v);
+  return out;
+}
+function fnv(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h;
+}
+function effVer(mode, dict, ex) {
+  // 有效词典（含例句与模式）指纹 → 进缓存 key：任何影响本次提示词的变化自动失效旧译文
+  const str = [...dict.entries()].sort().map(([k, v]) => k + '=' + v).join('|')
+    + '#' + [...ex.entries()].sort().map(([k, v]) => k + '=' + (v[0] || '') + '>' + (v[1] || '')).join('|');
+  return (mode === 'all' ? 'A' : 'a') + dict.size.toString(36) + '-' + fnv(str).toString(36);
 }
 function escapeRe(str) { return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 function applyDictOut(text, dict, srcZh) {
@@ -182,14 +302,26 @@ function enforceDictOut(out, dict, sourceText, srcZh) {
   }
   return enforceOne(out, sourceText);
 }
-function systemPromptWithDict(dict) {
+function systemPromptWithDict(dict, ex) {
   const g = dictLines(dict);
-  return g
-    ? SYSTEM_PROMPT + '\n术语表（印尼语→中文，大小写不限，下列术语【必须】翻译成指定译文，不得意译、不得保留原文）：'
-      + g + '\n反向术语表（中文→印尼语，下列中文词【必须】翻译成指定印尼语）：' + dictLinesRev(dict)
-      + '\n术语必须整词精确匹配后再套用：表中相近的术语（如 mixing 与 mixer）是不同词，'
-      + '不得互相顶替；原文单词与表中词条不完全相同（多字母、少字母、词形变化）时不套表，按正常翻译处理。'
-    : SYSTEM_PROMPT;
+  // v1.1.24：例句独立成框 → 只有例句、没词条时也要注入例句
+  const exId = exLines(ex), exZh = exLinesRev(ex);
+  if (!g) {
+    if (!(exId || exZh)) return SYSTEM_PROMPT;
+    return SYSTEM_PROMPT + '\n翻译示例（模仿其口语风格与术语用法，但只翻译给你的消息，不要输出示例）：\n' + exId + (exZh ? '\n' + exZh : '');
+  }
+  let s = SYSTEM_PROMPT
+    + '\n术语表（印尼语→中文，大小写不限，下列术语【必须】翻译成指定译文，不得意译、不得保留原文）：'
+    + g + '\n反向术语表（中文→印尼语，下列中文词【必须】翻译成指定印尼语）：' + dictLinesRev(dict)
+    + '\n术语必须整词精确匹配后再套用：表中相近的术语（如 mixing 与 mixer）是不同词，'
+    + '不得互相顶替；原文单词与表中词条不完全相同（多字母、少字母、词形变化）时不套表，按正常翻译处理。';
+  // v1.1.23 例句：与 APK 词典一致，给整句语境示例（印尼→中文方向 + 反向各列）
+  if (exId || exZh) {
+    s += '\n翻译示例（模仿其术语用法与口语风格，但只翻译给你的消息，不要输出示例）';
+    if (exId) s += '\n' + exId;
+    if (exZh) s += '\n' + exZh;
+  }
+  return s;
 }
 
 // ---------------- LLM 调用 ----------------
@@ -299,16 +431,16 @@ const SYSTEM_PROMPT = [
   '规则：印尼语消息翻译成简体中文；中文消息翻译成印尼语；英语等其他语言翻译成简体中文。',
   '保持口语化，保留表情符号、数字、@ 提及原样。',
   '必须逐行翻译：原文每一行（含换行符\\n分隔的行）都要翻译并在译文中保留同样的换行，不得合并、省略或重排任何一行。',
-  '专有名词（人名、地名、产品型号）可保留原文。',
+  '专有名词处理：产品型号、编号、代码、缩写保留原文；印尼语人名尽量用常见汉字音译（如 Adyanto→阿迪扬托、Setiaji→斯迪亚吉），人名后可括号保留原文；不要把整条消息原样返回。',
   '输出：只输出一个 JSON 字符串数组，长度、顺序与输入完全一致。不要输出任何其他文字。',
 ].join('\n');
 
-async function translateBatch(cfg, texts) {
+async function translateBatch(cfg, texts, dict = normDict(cfg.customDict), ex = normDictEx(cfg.customDictEx)) {
   const userPayload = JSON.stringify(texts);
   const chars = texts.reduce((s, t) => s + t.length, 0); // v1.1.4：按总字符给预算，长报告不被截断
   const budget = Math.min(8192, 200 + Math.ceil(chars * 2.5));
   const content = await chatCompletion(cfg, [
-    { role: 'system', content: systemPromptWithDict(normDict(cfg.customDict)) },
+    { role: 'system', content: systemPromptWithDict(dict, ex) },
     { role: 'user', content: userPayload },
   ], 50000, budget);
   const arr = parseJsonArray(content);
@@ -318,13 +450,13 @@ async function translateBatch(cfg, texts) {
   return arr;
 }
 
-async function translateSingle(cfg, text) {
+async function translateSingle(cfg, text, dict = normDict(cfg.customDict), ex = normDictEx(cfg.customDictEx)) {
   // 逐条模式不依赖 JSON，直接要译文。超时短（12s）：降级路径是并行的，
   // 但单条也不能吊太久，否则整批回话慢。
   const target = detectTarget(text);
   const targetName = target === 'id' ? '印尼语' : '简体中文';
   const content = await chatCompletion(cfg, [
-    { role: 'system', content: '你是聊天消息翻译器。把用户给你的消息翻译成' + targetName + '，口语化，只输出译文本身，不要任何解释、引号或前缀。保留表情符号和换行。' + (dictLines(normDict(cfg.customDict)) ? '术语表：' + (target === 'id' ? dictLinesRev(normDict(cfg.customDict)) : dictLines(normDict(cfg.customDict))) + '（下列术语必须按指定译文翻译，不得意译或保留原文）' : '') },
+    { role: 'system', content: '你是聊天消息翻译器。把用户给你的消息翻译成' + targetName + '，口语化，只输出译文本身，不要任何解释、引号或前缀。保留表情符号和换行。' + (dictLines(dict) ? '术语表：' + (target === 'id' ? dictLinesRev(dict) : dictLines(dict)) + '（下列术语必须按指定译文翻译，不得意译或保留原文）' : '') + (exLines(ex) || exLinesRev(ex) ? '\n翻译示例（模仿术语用法，只翻译给你的消息）：\n' + (target === 'id' ? exLinesRev(ex) : exLines(ex)) : '') },
     { role: 'user', content: text },
   ], 25000, Math.min(4096, 100 + Math.ceil(text.length * 3)));
   return content.trim();
@@ -343,7 +475,7 @@ function looksLikeEcho(src, val) {
   // 不用「缺汉字/缺拉丁词」启发式——合法译文也可能不含目标文字（纯型号、URL）。
   return normEcho(s) === normEcho(v);
 }
-const ECHO_MSG = '模型返回了原文（未翻译），点 ⟳ 刷新';
+const ECHO_MSG = '模型返回了原文（未翻译）'; // v1.1.24：不再当失败抛错，仅保留给旧测试桩引用
 
 const MAX_TEXT_LEN = 4000;   // 单条上限
 const MAX_BATCH_ITEMS = 12;  // 一批最多条数（过多模型容易漏条/截断）
@@ -381,17 +513,22 @@ async function flush() {
 
   const c = await loadCache();
   const dict = normDict(cfg.customDict);
-  const dver = dictVer(dict); // v1.1.8 词典版本进缓存 key：改词典自动失效
+  const exAll = normDictEx(cfg.customDictEx);
+  const mode = cfg.dictMode === 'all' ? 'all' : 'auto';
+  const ever = effVer(mode, dict, exAll); // v1.1.23 指纹=模式+词条+例句：任何影响提示词的变化自动失效
 
   // 先查缓存
+  let hitN = 0;
   const misses = [];
   for (const item of items) {
-    const key = detectTarget(item.text) + '|' + dver + '|' + item.text;
+    const key = detectTarget(item.text) + '|' + ever + '|' + item.text;
     const hit = c.get(key);
-    // v1.1.19：缓存里的回显脏数据不再采信 → 重新翻译并覆盖
-    if (hit !== undefined && !looksLikeEcho(item.text, hit)) item.resolve(hit);
+    // v1.1.24：回显不再当失败（人名/型号保留原文是正常行为）→ 缓存里的原样结果直接采信，
+    // content 端标注「专有名词」。旧版每次点击都重新计费（用户日志：Adyanto Setiaji 4 次）。
+    if (hit !== undefined) { item.resolve(hit); hitN++; }
     else misses.push({ ...item, key });
   }
+  if (hitN) logLine('cache', `缓存命中 ${hitN} 条（本轮 ${items.length}）`);
   if (!misses.length) return;
 
   // 按条数+字符预算切分成若干批
@@ -411,13 +548,28 @@ async function flush() {
   if (cur.length) batches.push(cur);
 
   for (const batch of batches) {
+    // v1.1.23 auto 模式：批量请求的提示词 = 批内所有文本命中词条的并集
+    // v1.1.24：例句独立成框后，命中逻辑改为「例句文本出现在当前句」并联收集（不再仅随词条键）
+    let bDict = dict, bEx = exAll;
+    if (mode === 'auto') {
+      bDict = new Map();
+      bEx = new Map();
+      for (const b of batch) {
+        for (const [k, v] of matchDictFor(mode, dict, b.sent)) bDict.set(k, v);
+        for (const [k, v] of exHitFor(exAll, b.sent)) bEx.set(k, v);
+      }
+    }
+    const t0 = Date.now();
     try {
-      const results = await translateBatch(cfg, batch.map((b) => b.sent));
+      const results = await translateBatch(cfg, batch.map((b) => b.sent), bDict, bEx);
+      logLine('api', `批量 ${batch.length} 条 ok ${Date.now() - t0}ms 词条${bDict.size}`);
       batch.forEach((b, idx) => {
         const rawVal = String(results[idx] ?? '').trim();
         const srcZh1 = detectTarget(b.sent) === 'id';
         const val = enforceDictOut(applyDictOut(rawVal, dict, srcZh1), dict, b.sent, srcZh1) || '⚠ 无译文';
-        if (looksLikeEcho(b.sent, val)) { b.reject(new Error(ECHO_MSG)); return; } // v1.1.19 回显不缓存
+        // v1.1.24 回显=专有名词保留原文：正常缓存并返回（content 端加标注），不再 reject。
+        // 旧版当失败→不缓存→用户再点再计费（日志实测同一条人名点了 4 次计 4 次费）。
+        if (looksLikeEcho(b.sent, val)) logLine('note', `保留原文(专名): "${b.sent.slice(0, 40)}"`);
         c.set(b.key, val);
         scheduleSaveCache();
         b.resolve(val);
@@ -425,16 +577,21 @@ async function flush() {
     } catch (err) {
       // 批量失败 → 逐条降级。必须并行：串行 N 条 × 超时 = 全挂十几分钟，
       // 译文行会一直显示「翻译中…」（用户实测 16 条卡死即此因）。
-      console.warn('[wTranslate] 批量失败，逐条并行重试:', err.message);
+      logLine('err', `批量失败→逐条重试 (${batch.length}条): ${err.message}`);
       let cursor = 0;
       const worker = async () => {
         while (cursor < batch.length) {
           const b = batch[cursor++];
           try {
             const sent2 = b.sent; const srcZh2 = detectTarget(sent2) === 'id';
-            const raw2 = await translateSingle(cfg, sent2);
+            // v1.1.23 auto 模式：逐条降级时按单句命中的词条过滤提示词
+            const sDict = mode === 'auto' ? matchDictFor(mode, dict, sent2) : dict;
+            const sEx = mode === 'auto' ? exHitFor(exAll, sent2) : exAll; // v1.1.24 例句并联命中
+            const t1 = Date.now();
+            const raw2 = await translateSingle(cfg, sent2, sDict, sEx);
+            logLine('api', `单条 ok ${Date.now() - t1}ms 词条${sDict.size} "${sent2.slice(0, 40)}"`);
             const val = enforceDictOut(applyDictOut(raw2, dict, srcZh2), dict, sent2, srcZh2);
-            if (looksLikeEcho(sent2, val)) { b.reject(new Error(ECHO_MSG)); continue; } // v1.1.19
+            if (looksLikeEcho(sent2, val)) logLine('note', `保留原文(专名): "${sent2.slice(0, 40)}"`); // v1.1.24
             c.set(b.key, val);
             scheduleSaveCache();
             b.resolve(val);
@@ -455,6 +612,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, error: 'texts 必须是数组' });
       return true;
     }
+    logLine('req', `收到翻译请求 ${msg.texts.length} 条`, msg.texts[0]);
     Promise.all(msg.texts.map((t) => enqueue(String(t)).catch((e) => ({ __error: e.message }))))
       .then((results) => {
         const translations = results.map((r) =>
@@ -507,6 +665,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       cache = new Map();
       await chrome.storage.local.remove(CACHE_KEY);
       sendResponse({ ok: true });
+    })();
+    return true;
+  }
+
+  if (msg?.type === 'wtranslate-backping') {
+    // v1.1.23 content 心跳：SW 被回收后由 content 拉起并记录启动
+    sendResponse({ ok: true, version: '1.1.23' });
+    return true;
+  }
+
+  if (msg?.type === 'wtranslate-log') {
+    // v1.1.23 日志通道：popup「导出日志」= {op:'get'}；「清空日志」= {op:'clear'}；content 上报 = {op:'push', lines:[...]}
+    (async () => {
+      if (msg.op === 'clear') {
+        await chrome.storage.local.remove(LOG_KEY);
+        sendResponse({ ok: true, cleared: true });
+        return;
+      }
+      if (msg.op === 'push') {
+        const items = (Array.isArray(msg.lines) ? msg.lines : []).slice(-LOG_MAX)
+          .map((l) => ({ t: Number(l && l.t) || Date.now(), lv: String(l && l.lv || 'info').slice(0, 8), m: String(l && l.m || '').slice(0, 200), ...(l && l.d ? { d: String(l.d).slice(0, 160) } : {}) }));
+        if (items.length) { logBuf.push(...items); while (logBuf.length > LOG_MAX) logBuf.shift(); flushLog(); }
+        sendResponse({ ok: true, buffered: logBuf.length });
+        return;
+      }
+      await (logSaving || Promise.resolve()); // 先把内存缓冲落盘再读，保证导出完整
+      if (logTimer) { clearTimeout(logTimer); flushLog(); await logSaving; }
+      const { [LOG_KEY]: arr } = await chrome.storage.local.get(LOG_KEY);
+      sendResponse({ ok: true, lines: Array.isArray(arr) ? arr : [] });
     })();
     return true;
   }

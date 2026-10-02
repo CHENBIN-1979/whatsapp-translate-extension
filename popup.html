@@ -16,14 +16,16 @@
     h1 .dot { width: 9px; height: 9px; border-radius: 50%; background: #25d366; display: inline-block; }
     .field { margin-bottom: 9px; }
     label { display: block; margin-bottom: 3px; color: #64748b; font-size: 12px; }
-    input[type=text], input[type=password], input[type=number], select {
+    input[type=text], input[type=password], input[type=number], select, textarea {
       width: 100%; box-sizing: border-box; padding: 6px 8px;
       border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12.5px; background: #fff;
+      font-family: inherit; resize: vertical;
     }
-    input:focus, select:focus { outline: 2px solid #5865f255; border-color: #5865f2; }
+    input:focus, select:focus, textarea:focus { outline: 2px solid #5865f255; border-color: #5865f2; }
     .row { display: flex; gap: 8px; }
     .row .field { flex: 1; }
     .switch-line { display: flex; align-items: center; justify-content: space-between; margin: 10px 0; }
+    .switch-line label { margin: 0; font-size: 13px; color: #1f2937; }
     button {
       border: none; border-radius: 6px; padding: 7px 12px; font-size: 12.5px;
       cursor: pointer; background: #5865f2; color: #fff;
@@ -41,17 +43,19 @@
     .profile-bar button { padding: 5px 8px; font-size: 12px; }
     #delProfile { background: #fee2e2; color: #991b1b; }
     .stats { color: #94a3b8; font-size: 11px; margin-top: 6px; }
+    details { margin: 8px 0; }
+    details summary { cursor: pointer; font-size: 13px; color: #1f2937; padding: 2px 0; user-select: none; }
   </style>
 </head>
 <body>
   <h1><span class="dot"></span>WhatsApp 实时翻译</h1>
 
   <div class="switch-line">
-    <label for="enabled" style="margin:0;font-size:13px;color:#1f2937">启用自动翻译</label>
+    <label for="enabled">启用点击翻译</label>
     <input type="checkbox" id="enabled" checked>
   </div>
-  <div style="display:flex;align-items:center;gap:6px;margin:2px 0 8px">
-    <label for="fast" style="margin:0;font-size:13px;color:#1f2937">极速模式（关闭模型思考链，实测约快一倍）</label>
+  <div class="switch-line" style="margin:2px 0 8px">
+    <label for="fast">极速模式（关闭模型思考链，实测约快一倍）</label>
     <input type="checkbox" id="fast" checked>
   </div>
 
@@ -88,15 +92,34 @@
     </div>
   </div>
 
-  <details id="dictBox" style="margin:8px 0">
-    <summary style="cursor:pointer;font-size:13px;color:#1f2937;padding:2px 0">专属词典（厂内术语，点展开）</summary>
+  <details id="dictBox">
+    <summary>专属词典（厂内术语，点展开）</summary>
+    <div class="switch-line" style="margin:6px 0 8px">
+      <label for="dictAllSw">全词典注入（开=整本词典每次进提示词；关=自动匹配，只注入当前句出现的术语）</label>
+      <input type="checkbox" id="dictAllSw">
+    </div>
     <div class="field" style="margin-top:6px">
-      <label>每行一个术语：<b>印尼文 = 中文</b>（冒号也可）。双向自动生效</label>
-      <textarea id="customDict" rows="5" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:12.5px;font-family:inherit;resize:vertical;background:#fff" placeholder="calender = 压延机&#10;emboss = 压花辊&#10;bahan baku = 原材料"></textarea>
-      <div class="hint" style="margin-top:2px">词典里的术语：对方印尼文消息→强制译成你写的中文；你打中文→强制译回印尼术语。改词典后旧译文自动重译。</div>
+      <label>每行一个术语：<b>印尼文 = 中文</b>（= : ： ＝ → 都认）。双向自动生效</label>
+      <textarea id="customDict" rows="5" placeholder="calender = 压延机&#10;emboss = 压花辊&#10;bahan baku = 原材料"></textarea>
+      <div class="hint" style="margin-top:2px">词典术语：对方印尼文消息→强制译成你写的中文；你打中文→强制译回印尼术语。自动匹配（默认）省 token、防相近词互相干扰；当前：<b id="dictModeAuto">自动匹配</b>。改词典/例句后旧译文自动重译。</div>
     </div>
     <div class="btns"><button id="saveDict" class="secondary" style="flex:1">保存词典（立即生效）</button></div>
   </details>
+
+  <details id="exBox">
+    <summary>例句（整句语境示例，点展开）</summary>
+    <div class="field" style="margin-top:6px">
+      <label>每行一个例句对：<b>印尼文例句 = 中文例句</b>（= : ： ＝ → 都认）。双向自动生效</label>
+      <textarea id="customEx" rows="5" placeholder="Mesin calender A06 rusak = 压延机A06坏了&#10;Pisau potong pinggir aus = 边切刀磨损了"></textarea>
+      <div class="hint" style="margin-top:2px">例句教模型整句的说法和语境：翻译的消息里出现某个例句（或它的印尼文原句）时，这条例句会连同译文参考送进提示词。自动匹配模式只注入命中的例句；全词典模式整本注入。</div>
+    </div>
+    <div class="btns"><button id="saveEx" class="secondary" style="flex:1">保存例句（立即生效）</button></div>
+  </details>
+
+  <div class="field" style="margin:8px 0">
+    <label>译文字号：<b id="fontSizeVal">15px</b>（拖动即时生效，不用刷新页面）</label>
+    <input type="range" id="fontSize" min="12" max="22" step="1" value="15" style="width:100%">
+  </div>
 
   <div class="btns">
     <button id="save">保存</button>
@@ -107,12 +130,17 @@
   <div id="status"></div>
   <div class="stats" id="stats"></div>
   <div class="hint">
-    译文显示在消息气泡下方：对方语言 → 中文，你的中文 → 印尼语。<br>
-    「＋ 新增」把当前表单存为新配置；下拉框随时切换，翻译立即用选中的模型。<br>
+    <b>点击翻译</b>：鼠标悬停对方消息有淡色提示，点一下才在该气泡下方出译文；不全局自动翻译，自己发送的消息不翻。<br>
     输入框右下角「译」按钮 = 反向翻译，再点一次还原原文。<br>
+    人名/型号若显示「专有名词，保留原文」属正常，点 ⟳ 可强制重译。<br>
     Key 仅保存在本机浏览器（chrome.storage.local），不上传任何地方。
   </div>
   <div class="btns"><button id="clearCache" class="secondary">清空翻译缓存</button></div>
+
+  <div class="btns" style="margin-top:6px">
+    <button id="exportLog" class="secondary">导出日志（复制）</button>
+    <button id="clearLog" class="secondary">清空日志</button>
+  </div>
 
   <script src="popup.js"></script>
 </body>

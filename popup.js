@@ -1,4 +1,4 @@
-/* popup.js — 设置页逻辑（v1.1.20 多模型配置列表） */
+/* popup.js — 设置页逻辑（v1.1.24：例句独立框 / 注入模式开关 / 折叠区默认收起各自记忆） */
 
 const $ = (id) => document.getElementById(id);
 const FIELDS = ['apiBase', 'apiKey', 'model', 'temperature'];
@@ -9,20 +9,70 @@ function setStatus(kind, text) {
   el.textContent = text;
 }
 
-// v1.1.8 词典文本 <-> {术语: 译文}：每行 "印尼文 = 中文"（支持 = / : / ：）
+// v1.1.24 词典/例句分离成两个框。词典行：印尼文 = 中文（分隔符兼容 = / : / ： / 全角＝ / → / ->）
+// 例句行：印尼文例句 = 中文例句（同分隔符）。旧版「术语 = 中文 | 例句」行在加载时自动拆分迁移。
+const KV_SEP = /(?:[=:：＝→]|->)/;
+function splitKV(line) {
+  const i = line.search(KV_SEP);
+  if (i < 0) return null;
+  const sepLen = line.startsWith('->', i) ? 2 : 1;
+  const k = line.slice(0, i).trim();
+  const v = line.slice(i + sepLen).replace(/^[=:：＝→\s]+/, '').trim();
+  if (!k || !v) return null;
+  return { k, v };
+}
+function parseDictText(txt) {
+  // 返回 {dict, ex, ignored}——ex 只在旧格式（行内含 | 例句）时非空，供迁移；ignored = 解析失败的行数
+  const dict = {}, ex = {};
+  let ignored = 0;
+  for (const rawLine of (txt || '').split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const bar = line.indexOf('|');
+    const head = bar < 0 ? line : line.slice(0, bar);
+    const tail = bar < 0 ? '' : line.slice(bar + 1);
+    const kv = splitKV(head);
+    if (!kv) { ignored++; continue; }
+    dict[kv.k] = kv.v;
+    if (tail.trim()) {
+      const ekv = splitKV(tail);
+      if (ekv) ex[kv.k.toLowerCase()] = [ekv.k, ekv.v]; // 旧格式例句 → 迁移进例句框
+    }
+  }
+  return { dict, ex, ignored };
+}
+function textToDict(txt) { return parseDictText(txt).dict; } // 兼容旧调用
 function dictToText(obj) {
   return Object.entries(obj || {}).map(([k, v]) => `${k} = ${v}`).join('\n');
 }
-function textToDict(txt) {
-  const out = {};
-  for (const line of (txt || '').split('\n')) {
-    const i = line.search(/[=:：]/);
-    if (i < 0) continue;
-    const k = line.slice(0, i).trim();
-    const v = line.slice(i + 1).replace(/^[=：:]\s*/, '').trim();
-    if (k && v) out[k] = v;
+// 例句框 <-> customDictEx = {印尼例句(小写键): [印尼例句, 中文例句]}
+function parseExText(txt) {
+  const ex = {};
+  let ignored = 0;
+  for (const rawLine of (txt || '').split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const kv = splitKV(line);
+    if (!kv) { ignored++; continue; }
+    ex[kv.k.toLowerCase()] = [kv.k, kv.v];
   }
-  return out;
+  return { ex, ignored };
+}
+function exToText(obj) {
+  const out = [];
+  for (const v of Object.values(obj || {})) {
+    const arr = Array.isArray(v) ? v : (typeof v === 'string' ? [v, ''] : null);
+    if (!arr) continue;
+    const idS = String(arr[0] || '').trim(), zhS = String(arr[1] || '').trim();
+    if (idS && zhS) out.push(`${idS} = ${zhS}`);
+    else if (idS || zhS) out.push(idS || zhS);
+  }
+  return out.join('\n');
+}
+function fmtLogTs(ts) {
+  const d = new Date(ts);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 // ---------------- v1.1.20 多配置列表 ----------------
@@ -125,11 +175,31 @@ async function persistProfiles() {
 
 async function load() {
   const cfg = await chrome.storage.local.get([
-    ...FIELDS, 'enabled', 'fast', 'customDict', 'profiles', 'activeProfile',
+    ...FIELDS, 'enabled', 'fast', 'customDict', 'customDictEx', 'dictMode', 'transFontSize',
+    'profiles', 'activeProfile', 'dictOpen', 'exOpen',
   ]);
   $('enabled').checked = cfg.enabled !== false;
   $('fast').checked = cfg.fast !== false;
+  // v1.1.24 词典/例句分框 + 旧格式（术语 = 中文 | 例句）自动迁移
+  let storedEx = cfg.customDictEx || {};
+  const legacy = parseDictText(dictToText(cfg.customDict || {})); // 纯词条文本，无 | 时 ex 为空
+  if (Object.keys(legacy.ex).length) storedEx = { ...storedEx, ...legacy.ex }; // 词条框里残留旧格式 → 例句提取走
   $('customDict').value = dictToText(cfg.customDict);
+  $('customEx').value = exToText(storedEx);
+  const needMigrate = Object.keys(legacy.ex).length > 0;
+  // v1.1.23 词典模式（v1.1.24 改开关：开=全词典）/ 字号 / 折叠区展开记忆（默认收起）
+  $('dictAllSw').checked = cfg.dictMode === 'all';
+  $('dictModeAuto').textContent = cfg.dictMode === 'all' ? '全词典注入' : '自动匹配';
+  const fs = Math.min(22, Math.max(12, Number(cfg.transFontSize) || 15));
+  $('fontSize').value = String(fs);
+  $('fontSizeVal').textContent = fs + 'px';
+  $('dictBox').open = cfg.dictOpen === true;
+  $('exBox').open = cfg.exOpen === true;
+  if (needMigrate) {
+    await chrome.storage.local.set({ customDict: legacy.dict, customDictEx: storedEx });
+    $('customDict').value = dictToText(legacy.dict);
+    setStatus('ok', '✔ 旧格式词典里的 "\| 例句" 已自动拆分到下方例句框');
+  }
 
   profiles = normalizeProfiles(cfg.profiles);
   if (!profiles.length && (cfg.apiKey || cfg.model || (cfg.apiBase && cfg.apiBase !== 'https://api.scnet.cn/api/llm/v1'))) {
@@ -146,9 +216,11 @@ async function load() {
   renderProfileSelect();
   renderForm();
 
-  chrome.runtime.sendMessage({ type: 'wtranslate-stats' }, (res) => {
+  chrome.runtime.sendMessage({ type: 'wtranslate-stats' }, async (res) => {
     if (res && typeof res.cacheSize === 'number') {
-      $('stats').textContent = `缓存：${res.cacheSize} 条（重复消息不会重复计费）`;
+      let noteN = 0;
+      try { const r = await chrome.storage.local.get('wtrans_' + 'note_v1'); noteN = Array.isArray(r.wtrans_note_v1) ? r.wtrans_note_v1.length : 0; } catch {}
+      $('stats').textContent = `缓存：${res.cacheSize} 条（重复消息不会重复计费）` + (noteN ? `　专有名词保留原文：${noteN} 条（正常，不算失败）` : '');
     }
   });
 }
@@ -170,8 +242,15 @@ $('save').addEventListener('click', async () => {
   }
   commitFormToProfile();
   await persistProfiles();
+  // v1.1.23 大「保存」键连带保存词典（旧版词典编辑必须另点「保存词典」，常被漏掉 → 词条丢失）
+  // v1.1.24 连带例句框一起存
+  const parsed = parseDictText($('customDict').value);
+  const parsedEx = parseExText($('customEx').value);
+  const mergedEx = { ...parsedEx.ex, ...parsed.ex }; // 词条框残留旧格式 "| 例句" → 一并收进例句库
+  await chrome.storage.local.set({ customDict: parsed.dict, customDictEx: mergedEx });
+  $('customEx').value = exToText(mergedEx);
   renderProfileSelect();
-  setStatus('ok', '✔ 已保存「' + currentProfile().name + '」，翻译即时生效（无需刷新 WhatsApp）');
+  setStatus('ok', '✔ 已保存「' + currentProfile().name + '」与词典（' + Object.keys(parsed.dict).length + ' 条/例句 ' + Object.keys(mergedEx).length + ' 条），翻译即时生效（无需刷新 WhatsApp）');
 });
 
 $('profileSel').addEventListener('change', async () => {
@@ -238,10 +317,52 @@ $('fast').addEventListener('change', async () => {
 });
 
 $('saveDict').addEventListener('click', async () => {
-  const dict = textToDict($('customDict').value);
-  await chrome.storage.local.set({ customDict: dict });
-  const n = Object.keys(dict).length;
-  setStatus('ok', n ? `✔ 词典已保存（${n} 条），立即生效；旧译文会自动重新翻译` : '✔ 词典已清空');
+  const parsed = parseDictText($('customDict').value);
+  const mergedEx = { ...(await chrome.storage.local.get('customDictEx')).customDictEx || {}, ...parsed.ex };
+  await chrome.storage.local.set({ customDict: parsed.dict, customDictEx: mergedEx });
+  // v1.1.23 规范化回写 + 忽略行明确警告（旧版全角＝等解析失败是静默丢词条的根因之一）
+  $('customDict').value = dictToText(parsed.dict);
+  const n = Object.keys(parsed.dict).length;
+  let msg = n ? `✔ 词典已保存（${n} 条），立即生效；旧译文会自动重新翻译` : '✔ 词典已清空';
+  if (parsed.ignored) msg += `\n⚠ ${parsed.ignored} 行没识别（缺 = 或 : 分隔符），已忽略，请检查写法`;
+  setStatus(n && !parsed.ignored ? 'ok' : parsed.ignored ? 'err' : 'ok', msg);
+});
+
+// v1.1.24 例句独立框：每行「印尼文例句 = 中文例句」
+$('saveEx').addEventListener('click', async () => {
+  const parsed = parseExText($('customEx').value);
+  await chrome.storage.local.set({ customDictEx: parsed.ex });
+  $('customEx').value = exToText(parsed.ex);
+  const n = Object.keys(parsed.ex).length;
+  let msg = n ? `✔ 例句已保存（${n} 条），立即生效；旧译文会自动重新翻译` : '✔ 例句已清空';
+  if (parsed.ignored) msg += `\n⚠ ${parsed.ignored} 行没识别（缺 = 或 : 分隔符），已忽略`;
+  setStatus(n && !parsed.ignored ? 'ok' : parsed.ignored ? 'err' : 'ok', msg);
+});
+
+// v1.1.24 词典注入模式改开关：开=全词典注入，关=自动匹配（省 token、防相近词干扰）
+$('dictAllSw').addEventListener('change', async () => {
+  const mode = $('dictAllSw').checked ? 'all' : 'auto';
+  await chrome.storage.local.set({ dictMode: mode });
+  $('dictModeAuto').textContent = mode === 'all' ? '全词典注入' : '自动匹配';
+  setStatus('ok', mode === 'all' ? '✔ 已切为「全词典」：每次翻译整本词典注入提示词' : '✔ 已切为「自动匹配」：只有句子里出现的术语/例句才注入提示词（推荐）');
+});
+
+// v1.1.23 折叠区展开状态记忆（v1.1.24 词典/例句两框各记各的，默认收起）
+$('dictBox').addEventListener('toggle', () => {
+  chrome.storage.local.set({ dictOpen: $('dictBox').open });
+});
+$('exBox').addEventListener('toggle', () => {
+  chrome.storage.local.set({ exOpen: $('exBox').open });
+});
+
+// v1.1.23 译文字号：拖动即时应用（存盘 → content.js 的 storage.onChanged 实时生效，免刷新、免额外权限）
+$('fontSize').addEventListener('input', () => {
+  const px = Math.min(22, Math.max(12, Number($('fontSize').value) || 15));
+  $('fontSizeVal').textContent = px + 'px';
+  clearTimeout($('fontSize')._t);
+  $('fontSize')._t = setTimeout(() => {
+    chrome.storage.local.set({ transFontSize: px });
+  }, 200);
 });
 
 $('test').addEventListener('click', async () => {
@@ -280,6 +401,28 @@ $('clearCache').addEventListener('click', () => {
     $('stats').textContent = '缓存：0 条';
     setStatus('ok', '缓存已清空');
   });
+});
+
+// ---------------- v1.1.23 运行日志 ----------------
+async function fetchLog() {
+  const { wtrans_log_v1: arr } = await chrome.storage.local.get('wtrans_' + 'log_v1');
+  return Array.isArray(arr) ? arr : [];
+}
+$('exportLog').addEventListener('click', async () => {
+  const lines = await fetchLog();
+  if (!lines.length) { setStatus('err', '✘ 日志为空。\n在 WhatsApp 页点几条消息翻译后再来导出。'); return; }
+  const text = lines.map((l) => `[${fmtLogTs(l.t)}] ${l.lv}: ${l.m}${l.d ? ' | ' + l.d : ''}`).join('\n');
+  const head = `WhatsApp翻译插件日志 v1.1.24　${lines.length} 条　导出时间 ${fmtLogTs(Date.now())}\n${'='.repeat(46)}\n`;
+  try {
+    await navigator.clipboard.writeText(head + text);
+    setStatus('ok', '✔ 日志（' + lines.length + ' 条）已复制到剪贴板，直接粘贴发给开发者即可');
+  } catch {
+    setStatus('busy', '⚠ 复制失败，日志全文如下，请手动选中复制：\n' + head + text);
+  }
+});
+$('clearLog').addEventListener('click', async () => {
+  await chrome.storage.local.remove('wtrans_' + 'log_v1');
+  setStatus('ok', '✔ 日志已清空');
 });
 
 load();

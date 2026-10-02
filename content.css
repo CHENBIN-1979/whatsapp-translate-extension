@@ -6,7 +6,7 @@
   padding: 4px 8px;
   border-radius: 6px;
   background: rgba(88, 101, 242, 0.09);
-  font-size: 15px;
+  font-size: var(--wtrans-fs, 15px); /* v1.1.23 弹窗字号可调：content.js 把 --wtrans-fs 挂到 <html> */
   line-height: 1.5;
   width: fit-content;
   max-width: 100%;
@@ -37,6 +37,13 @@
 
 .wtrans-body {
   color: #25d366; /* v1.1.6 用户要求绿色（WhatsApp 品牌绿，深色/浅色主题均可读） */
+}
+
+/* v1.1.23 字号即时生效：加在 .wtrans-body 上并用 !important——
+   WhatsApp 自身样式会给文字节点带 font-size，普通行内变量会被盖掉；
+   该选择器已比页面任何单类规则更具体，改滑块后【已存在】的译文行也立刻变大小 */
+.wtrans-row .wtrans-body {
+  font-size: var(--wtrans-fs, 15px) !important;
 }
 
 .wtrans-failed .wtrans-body {
@@ -103,4 +110,24 @@
   opacity: 1;
 }
 
+/* v1.1.24 专有名词/编号保留原文的灰字标注 */
+.wtrans-row .wtrans-note {
+  color: #8696a7;
+  font-size: 12px;
+  margin-left: 4px;
+  font-style: normal;
+}
+
 .wtrans-row .wtrans-ver { margin-right: 2px; }
+
+/* v1.1.22 点击翻译模式：可翻译的对方消息加 hover 提示，点一下才译 */
+.wtrans-clickable {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.12s;
+}
+
+.wtrans-clickable:hover {
+  background: rgba(88, 101, 242, 0.10);
+  box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.10);
+}

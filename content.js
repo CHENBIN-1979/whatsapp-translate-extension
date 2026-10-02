@@ -7,17 +7,41 @@
  *   ③ 扫描扑空静默跳过（不再留误导性的 lastErr）；成功一轮即清 lastErr。
  * v1.1.4：解决「长文只翻一行/丢换行」——多行消息取整个文本容器（含 <br>），
  *   不再只取最长叶子 span；兜底超时对齐后端预算 90s→300s。
+ * v1.1.22：改「点击翻译」——不再全局自动翻译，鼠标点哪条（对方消息）才译哪条；
+ *   自己发送的消息（out 气泡）彻底不再翻译（含点击）。
+ * v1.1.23：译文字号可调（--wtrans-fs 实时生效）；本地日志上报后台 wtrans_log_v1；
+ *   词典例句/自动匹配模式在后台生效，content 只负责点击送译。
+ * v1.1.24：模型回显（人名/型号保留原文）不再标失败，改灰字「专有名词」标注并正常
+ *   缓存——重复点击零计费（旧版每次回显都报 ⚠ → 用户反复点反复付费）。⟳ 仍可强刷。
  */
 
 (() => {
   if (window.__wTranslateLoaded) return;
   window.__wTranslateLoaded = true;
 
-  const VERSION = '1.1.21';
+  const VERSION = '1.1.24';
   let enabled = true;
   const rowsByEl = new WeakMap();     // 文本元素 → 注入的译文行
+  const clickTargets = new WeakMap(); // v1.1.22 点击翻译：文本元素 → {bubble, el, text, out}
   const inFlight = new Set();
   const failedEls = new WeakSet();     // v1.1.19 失败过的元素：自动重试仅一次，防持续失败时译文行无限累积
+
+  // ---------- v1.1.23 本地日志（环形 60 条，定期合并上报 background 的 wtrans_log_v1） ----------
+  const cLogBuf = [];
+  let cLogTimer = null;
+  function cLog(level, msg, d) {
+    const rec = { t: Date.now(), lv: level, m: String(msg).slice(0, 200) };
+    if (d) rec.d = String(d).slice(0, 160);
+    cLogBuf.push(rec);
+    while (cLogBuf.length > 60) cLogBuf.shift();
+    if (!cLogTimer) cLogTimer = setTimeout(cLogFlush, 2500);
+  }
+  function cLogFlush() {
+    cLogTimer = null;
+    if (!cLogBuf.length) return;
+    const lines = cLogBuf.splice(0);
+    try { chrome.runtime.sendMessage({ type: 'wtranslate-log', op: 'push', lines }, () => void chrome.runtime.lastError); } catch {}
+  }
 
   // ---------- 诊断 ----------
   const diag = {
@@ -53,10 +77,21 @@
   }
 
   // ---------- 配置 ----------
+  // v1.1.23 译文字号：CSS 变量挂到 <html>，所有 .wtrans-row 用 var() 取大小
+  function applyFontSize(px) {
+    const v = Math.min(22, Math.max(12, Number(px) || 15));
+    try { document.documentElement.style.setProperty('--wtrans-fs', v + 'px'); } catch {}
+  }
   async function loadEnabled() {
-    const { enabled: e } = await chrome.storage.local.get('enabled');
-    enabled = e !== false;
+    const cfg = await chrome.storage.local.get(['enabled', 'transFontSize']);
+    enabled = cfg.enabled !== false;
+    applyFontSize(cfg.transFontSize);
     saveDiag(true);
+    cLog('info', `content v${VERSION} 启动（enabled=${enabled} 字号=${cfg.transFontSize || 15}px）`);
+    // v1.1.23 心跳：拉起可能被回收的 service worker，顺便确认后台在线
+    try { chrome.runtime.sendMessage({ type: 'wtranslate-backping' }, (res) => {
+      if (chrome.runtime.lastError || !res?.ok) cLog('warn', '后台 SW 未响应（首次请求时会自动拉起）');
+    }); } catch {}
   }
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.enabled) {
@@ -64,6 +99,9 @@
       if (!enabled) removeComposeButton();
       else ensureComposeButton();
       saveDiag(true);
+    }
+    if (area === 'local' && changes.transFontSize) {
+      applyFontSize(changes.transFontSize.newValue); // 弹窗拖字号 → 免刷新实时生效
     }
   });
 
@@ -407,41 +445,30 @@
           if (!eligible(t)) continue;
           if (sp.hasAttribute('title') && !sp.classList.contains('selectable-text')) continue; // 群成员昵称带 title（维持原规则）
           seen.add(host);
-          usable.push({ bubble: host, el: sp, text: t, out: false });
+          // v1.1.22 兜底路径也要认得出「自己发的」：message-out 结构特征（旧版 WA 类名）
+          const outFallback = !!(host.closest && (host.matches('.message-out, [class*="message-out"]') || host.closest('.message-out, [class*="message-out"]')));
+          usable.push({ bubble: host, el: sp, text: t, out: outFallback });
         }
       }
       diag.candidates = usable.length;
 
+      // ---------- v1.1.22 点击翻译模式 ----------
+      // 不再自动注入译文行、不再自动排队送译。扫描只做两件事：
+      // ① 把「对方消息」(out=false) 登记为可点目标（WeakMap，随元素生命周期失效）；
+      // ② 给可点文本加 wtrans-clickable 类（hover 有淡色提示；自己发的消息永不加）。
+      // 用户鼠标点哪条 → translateOnClick 才插行送译。
       for (const item of usable) {
-        if (inFlight.has(item.el)) continue;
+        if (item.out) continue; // 自己发送的消息：彻底不翻译（v1.1.22）
+        clickTargets.set(item.el, item);
+        // 气泡层一并登记：点气泡任意位置（含头像旁留白/时间戳）都译本条
+        if (item.bubble && item.bubble !== item.el) clickTargets.set(item.bubble, item);
+        try { item.el.classList.add('wtrans-clickable'); } catch {}
+        // 已点击译过的条目：文本被编辑则撤掉旧译文行，等用户再点
         const prev = rowsByEl.get(item.el);
-        if (prev) {
-          // 已处理过：若文本未变且行仍在 DOM → 跳过；文本变了（消息编辑）→ 重译
-          if (!document.contains(prev)) { rowsByEl.delete(item.el); }
-          else if (prev._text === item.text) continue;
-          else { prev.remove(); rowsByEl.delete(item.el); failedEls.delete(item.el); } // 文本变了→允许重译
+        if (prev && document.contains(prev) && prev._text !== item.text) {
+          prev.remove(); rowsByEl.delete(item.el); failedEls.delete(item.el);
         }
-        if (failedEls.has(item.el)) continue; // v1.1.19 该条上一轮已失败（行还在），不再自动重排——用户点 ⟳
-        const row = makeRow(item.out);
-        row._text = item.text;
-        row._el = item.el; // v1.1.19 ⟳ 刷新时找回归属元素（inFlight/rowsByEl 键）
-        bindRetry(row, item);
-        try {
-          // 放置策略：译文作为 message 气泡层（copyable-text 的父级）的最后一个子节点，
-          // 视觉上位于原文下方且不被 WhatsApp 选区/复制吞掉；找不到气泡层则退回紧跟原文节点。
-          const host = item.el.closest('[class*="message"], [role="listitem"], [role="row"]') || item.bubble;
-          const anchor = (host && host.contains(item.el)) ? host : item.el;
-          if (anchor === host && anchor !== item.el) {
-            anchor.appendChild(row);
-          } else {
-            item.el.insertAdjacentElement('afterend', row);
-          }
-          injectedN++;
-        } catch { continue; }
-        rowsByEl.set(item.el, row);
-        queueForTranslation(item.el, row, item.text);
       }
-      if (pending.length) scheduleFlush();
       saveDiag(usable.length > 0);
     } catch (e) {
       diag.lastErr = String((e && e.message) || e);
@@ -521,6 +548,35 @@
     if (s.length < 6) return false;
     return normEchoC(s) === normEchoC(v);
   }
+  // v1.1.24：回显=专有名词保留原文（人名/型号），正常结果而非失败。行内加灰字标注，
+  // ⟳ 仍可强制重译（想逼模型音译时用）。旧版标 ⚠ 失败 → 用户反复点反复计费。
+  function renderResult(row, el, t) {
+    if (isEchoText(row._text, t)) {
+      row._body.textContent = t;
+      const note = document.createElement('span');
+      note.className = 'wtrans-note';
+      note.textContent = '（专有名词/编号，保留原文；点 ⟳ 可强制重译）';
+      row._body.appendChild(note);
+      noteEcho(row._text); // 上报给 popup 统计显示
+    } else {
+      row._body.textContent = t;
+    }
+    row._failed = false;
+    if (el) rowsByEl.set(el, row);
+    failedEls.delete(el);
+  }
+  const notedTexts = new Set();
+  function noteEcho(text) {
+    if (notedTexts.has(text)) return;
+    notedTexts.add(text);
+    cLog('note', `专有名词保留原文: ${text.slice(0, 50)}`);
+    try {
+      chrome.storage.local.get('wtrans_note_v1', (r) => {
+        const arr = Array.isArray(r.wtrans_note_v1) ? r.wtrans_note_v1 : [];
+        if (!arr.includes(text) && arr.length < 100) { arr.push(text); chrome.storage.local.set({ wtrans_note_v1: arr }); }
+      });
+    } catch {}
+  }
   function doRefresh(row) {
     row._busy = true;
     row._body.textContent = '翻译中…';
@@ -533,12 +589,10 @@
       if (el) inFlight.delete(el);
       row._busy = false;
       if (!document.contains(row)) return;
-      if (t && !isEchoText(text, t)) {
-        row._body.textContent = t;
-        row._failed = false;
-        if (el) { rowsByEl.set(el, row); failedEls.delete(el); } // 恢复映射：扫描跳过
+      if (t) {
+        renderResult(row, el, t); // v1.1.24 刷新后回显同样正常显示+标注
       } else {
-        markFailed(row, err || '刷新后仍是原文（点 ⟳ 再试）');
+        markFailed(row, err || '刷新后仍无译文（点 ⟳ 再试）');
       }
     });
   }
@@ -548,62 +602,88 @@
     });
   }
 
-  function bindRetry(row, item) {
+  // ---------- v1.1.22 点击翻译 ----------
+  // 点击失败译文行 = 强制刷新重译（旧「点⚠行重排扫描」逻辑已被点击模式取代）
+  function bindRowRetry(row) {
     row.addEventListener('click', (ev) => {
       ev.stopPropagation();
       if (ev.target && ev.target.classList && ev.target.classList.contains('wtrans-refresh')) return; // ⟳ 自处理
-      if (!row._failed) return;
-      rowsByEl.delete(item.el);
-      inFlight.delete(item.el);
-      failedEls.delete(item.el); // v1.1.19 点击 ⚠ 行 = 授权重新排队
-      row.remove();
-      scanMessages();
+      if (!row._failed) return; // 成功译文行点击无动作（⟳ 仍可强刷）
+      if (row._el) { inFlight.delete(row._el); failedEls.delete(row._el); }
+      doRefresh(row);
     });
   }
 
-  async function runBatch(items) {
-    const texts = items.map((i) => i.text);
-    const res = await requestTranslations(texts);
-    items.forEach((item, idx) => {
-      const t = res.translations?.[idx];
-      const row = item.row;
-      if (!document.contains(row)) { inFlight.delete(item.el); return; } // WhatsApp 重渲染掉了气泡
-      if (typeof t === 'string' && t.trim() && !isEchoText(item.text, t)) {
-        row._body.textContent = t;
-        row._failed = false;
-      } else if (typeof t === 'string' && t.trim()) {
-        // v1.1.19：模型把原文吐回来 = 未翻译，按失败处理（行显示⚠，点 ⟳ 强制重译）
-        markFailed(row, '显示的是原文，未翻译成功');
-        failedEls.add(item.el); // 不再自动重排队（防持续失败时译文行累积）；⟳ 手动刷新
+  function insertRow(el, bubble, text) {
+    const row = makeRow(false);
+    row._text = text;
+    row._el = el;
+    bindRowRetry(row);
+    try {
+      // 放置策略（沿用 v1.1.19）：译文作为 message 气泡层的最后一个子节点，
+      // 视觉上位于原文下方且不被 WhatsApp 选区/复制吞掉；找不到气泡层则退回紧跟原文节点。
+      const host = el.closest('[class*="message"], [role="listitem"], [role="row"]') || bubble;
+      const anchor = (host && host.contains(el)) ? host : el;
+      if (anchor === host && anchor !== el) {
+        anchor.appendChild(row);
       } else {
-        markFailed(row, (res.errors?.[idx] || '翻译失败') + '（点 ⟳ 或点击此行重试）');
-        failedEls.add(item.el);
+        el.insertAdjacentElement('afterend', row);
       }
-      inFlight.delete(item.el);
+      injectedN++;
+    } catch { return null; }
+    rowsByEl.set(el, row);
+    return row;
+  }
+
+  function translateOnClick(el, item) {
+    if (inFlight.has(el)) return; // 已在翻译中
+    const prev = rowsByEl.get(el);
+    if (prev && document.contains(prev)) {
+      // 已有译文行：失败→重译；成功/翻译中→不重复发请求
+      if (prev._failed && !prev._busy) { cLog('click', `重译失败行: ${item.text.slice(0, 50)}`); doRefresh(prev); }
+      else cLog('click', `重复点击(缓存/已有行): ${item.text.slice(0, 40)}`);
+      return;
+    }
+    const row = insertRow(el, item.bubble, item.text);
+    if (!row) return;
+    inFlight.add(el);
+    cLog('click', `点击翻译: ${item.text.slice(0, 60)}`);
+    requestOne(item.text, (t, err) => {
+      inFlight.delete(el);
+      if (!document.contains(row)) return;
+      if (t) {
+        renderResult(row, el, t); // v1.1.24：回显→正常显示+专名标注（旧版标失败→再点再计费）
+      } else {
+        cLog('err', `翻译失败: ${item.text.slice(0, 50)} → ${err || '无译文'}`);
+        markFailed(row, (err || '翻译失败') + '（点 ⟳ 或再点一次原文重试）');
+        failedEls.add(el);
+      }
+      saveDiag(true);
     });
-    saveDiag();
   }
 
-  function queueForTranslation(textEl, row, text) {
-    inFlight.add(textEl);
-    pending.push({ el: textEl, row, text });
-  }
-
-  let pending = [];
-  let flushTimer = null;
-  function scheduleFlush() {
-    clearTimeout(flushTimer);
-    flushTimer = setTimeout(async () => {
-      if (!pending.length) return;
-      const batch = pending;
-      pending = [];
-      // 切成 ≤12 条/组并发发送：早组早回，译文逐组出现；
-      // 单请求塞 16+ 条会让后台一次要等几十秒，用户视角=一直「翻译中…」。
-      const groups = [];
-      for (let i = 0; i < batch.length; i += 12) groups.push(batch.slice(i, i + 12));
-      await Promise.all(groups.map(runBatch));
-    }, 300);
-  }
+  // 全局单击监听：从事件路径里找扫描登记过的「对方消息」文本元素/气泡（外层优先→
+  // 点气泡任意位置含头像旁留白都能命中；译文行自身除外）。
+  document.addEventListener('click', (ev) => {
+    if (!enabled) return;
+    const path = (typeof ev.composedPath === 'function') ? ev.composedPath() : null;
+    let hit = null;
+    if (path) {
+      for (const node of path) {
+        if (!node || node.nodeType !== 1) continue;
+        if (node.classList && node.classList.contains('wtrans-row')) return; // 译文行自己的点击（重试/⟳）
+        if (clickTargets.has(node)) { hit = clickTargets.get(node); break; }
+      }
+    } else {
+      let n = ev.target;
+      while (n && n.nodeType === 1) {
+        if (n.classList && n.classList.contains('wtrans-row')) return;
+        if (clickTargets.has(n)) { hit = clickTargets.get(n); break; }
+        n = n.parentElement;
+      }
+    }
+    if (hit && !hit.out) translateOnClick(hit.el, hit);
+  }, false);
 
   // ---------- 输入框反向翻译 ----------
   let composeBtn = null;
