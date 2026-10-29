@@ -16,6 +16,12 @@
  *          「专有名词」标注，重复点击零计费（修复用户日志：同一人名点 4 次计 4 次费）；
  *          系统提示词强化人名音译规则；例句改为独立框（customDictEx 单独编辑，
  *          格式「印尼文 = 中文」逐行）；dictMode 下拉改开关（开=全词典/关=自动匹配）。
+ * v1.1.25：端点不再写死云端 —— normalizeEndpoint() 规范化任意端点（补 scheme/补 /v1/去尾斜杠），
+ *          isLocalEndpoint() 判定本机/局域网；测试连接回报端点类型与延迟。
+ *          manifest 的 host_permissions 加通配的 http 主机（实测 Chrome 对已授权 host
+ *          绕过 CORS，故服务端无需配 cors_origins，任意本地 IP 都能直连）。
+ *          极速模式同时发 chat_template_kwargs.enable_thinking（本地推理模型只认这个，
+ *          实测 38.0s → 0.3s）；本地端点单条超时 25s → 90s。
  */
 const DEFAULTS = {
   apiBase: 'https://api.scnet.cn/api/llm/v1',
@@ -351,8 +357,41 @@ async function getConfig() {
   return cfg;
 }
 
+// ---------------- 端点规范化（v1.1.25） ----------------
+// 用户可填任意端点：本地 Strata（http://192.168.2.153:8085）、局域网服务、https 云端。
+// 规则：
+//   ① 空 → 回落 DEFAULTS.apiBase（兼容旧配置）
+//   ② 补 scheme（没写 http:// 就当 https://；纯 IP/localhost 缺省走 http://）
+//   ③ 补路径：没有 /v1 之类的后缀 → 自动补 /v1（本地 Strata 只需填到端口）
+//   ④ 去尾斜杠
+function normalizeEndpoint(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return DEFAULTS.apiBase;
+  s = s.replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(s)) {
+    // 纯 IP / localhost / 私有网段 → http；其余（域名）→ https
+    const hostish = s.split('/')[0].split(':')[0];
+    const isLocal = /^(localhost$|\d{1,3}(\.\d{1,3}){3}$|\[.*\]$)/.test(hostish);
+    s = (isLocal ? 'http://' : 'https://') + s;
+  }
+  // 已经有路径段（除根）就原样用；只有 host[:port] 才补 /v1
+  const m = s.match(/^(https?:\/\/[^/]+)(\/.*)?$/i);
+  if (m && !m[2]) return m[1] + '/v1';
+  return s;
+}
+
+// 该端点是本机/局域网吗（用于 UI 标注，以及决定要不要走 http）
+function isLocalEndpoint(url) {
+  try {
+    const h = new URL(url).hostname;
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1'
+      || h.startsWith('192.168.') || h.startsWith('10.')
+      || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
+  } catch { return false; }
+}
+
 async function chatCompletion(cfg, messages, timeoutMs = 30000, maxTokens = 0) {
-  const base = (cfg.apiBase || DEFAULTS.apiBase).replace(/\/+$/, '');
+  const base = normalizeEndpoint(cfg.apiBase);
   const url = base + '/chat/completions';
   const body = {
     model: cfg.model || DEFAULTS.model,
@@ -363,8 +402,13 @@ async function chatCompletion(cfg, messages, timeoutMs = 30000, maxTokens = 0) {
   // 极速模式：关思考型模型思维链（实测翻译 7.3s→3.6s）；记住网关不认识的字段，之后不再撞 400
   if (cfg.fast !== false && !chatCompletion._unsupported?.has('enable_thinking')) {
     body.enable_thinking = false;
+    // v1.1.25：本地推理模型（如 Strata 的 Qwen3.8-Flash-Next）不认顶层 enable_thinking，
+    // 认 chat_template_kwargs.enable_thinking —— 实测 38.0s → 0.3s（思维链 154 字符 → 0）。
+    // 顶层那个继续发（兼容 scnet 等认它的网关），不认识的网关会 400 → 下面剥字段重试。
+    body.chat_template_kwargs = { enable_thinking: false };
   } else {
     delete body.enable_thinking;
+    delete body.chat_template_kwargs;
   }
   if (chatCompletion._unsupported?.has('max_tokens')) delete body.max_tokens;
   const doFetch = async (b) => {
@@ -393,11 +437,12 @@ async function chatCompletion(cfg, messages, timeoutMs = 30000, maxTokens = 0) {
   try {
     data = await doFetch(body);
   } catch (e) {
-    // 部分网关不接受 max_tokens / enable_thinking（400/422）→ 逐个剥掉可选字段重试，并记住不再发送
+    // 部分网关不接受 max_tokens / enable_thinking / chat_template_kwargs（400/422）
+    // → 逐个剥掉可选字段重试，并记住不再发送
     if (/API 400|API 422/.test(e.message)) {
       chatCompletion._unsupported = chatCompletion._unsupported || new Set();
       let recovered = false;
-      for (const opt of ['enable_thinking', 'max_tokens']) {
+      for (const opt of ['chat_template_kwargs', 'enable_thinking', 'max_tokens']) {
         if (opt in body) { delete body[opt]; chatCompletion._unsupported.add(opt); recovered = true; break; }
       }
       if (recovered) data = await doFetch(body);
@@ -455,10 +500,13 @@ async function translateSingle(cfg, text, dict = normDict(cfg.customDict), ex = 
   // 但单条也不能吊太久，否则整批回话慢。
   const target = detectTarget(text);
   const targetName = target === 'id' ? '印尼语' : '简体中文';
+  // v1.1.25：本地端点放宽单条超时（首次请求含 prefill/排队，可能 30s+；
+  // 云端保持 25s 不变，避免拖慢整批）。
+  const timeoutMs = isLocalEndpoint(normalizeEndpoint(cfg.apiBase)) ? 90000 : 25000;
   const content = await chatCompletion(cfg, [
     { role: 'system', content: '你是聊天消息翻译器。把用户给你的消息翻译成' + targetName + '，口语化，只输出译文本身，不要任何解释、引号或前缀。保留表情符号和换行。' + (dictLines(dict) ? '术语表：' + (target === 'id' ? dictLinesRev(dict) : dictLines(dict)) + '（下列术语必须按指定译文翻译，不得意译或保留原文）' : '') + (exLines(ex) || exLinesRev(ex) ? '\n翻译示例（模仿术语用法，只翻译给你的消息）：\n' + (target === 'id' ? exLinesRev(ex) : exLines(ex)) : '') },
     { role: 'user', content: text },
-  ], 25000, Math.min(4096, 100 + Math.ceil(text.length * 3)));
+  ], timeoutMs, Math.min(4096, 100 + Math.ceil(text.length * 3)));
   return content.trim();
 }
 
@@ -630,10 +678,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         const cfg = { ...DEFAULTS, ...msg.config };
+        const t0 = Date.now();
         const out = await translateSingle(cfg, '你好，这批货明天发货');
-        sendResponse({ ok: true, sample: out });
+        const ms = Date.now() - t0;
+        // v1.1.25：回报规范化后的端点 + 本地/云端类型 + 延迟，供弹窗显示
+        const ep = normalizeEndpoint(cfg.apiBase);
+        sendResponse({ ok: true, sample: out, endpoint: ep, local: isLocalEndpoint(ep), ms });
       } catch (e) {
-        sendResponse({ ok: false, error: String(e?.message || e) });
+        const ep = normalizeEndpoint(msg.config?.apiBase);
+        sendResponse({ ok: false, error: String(e?.message || e), endpoint: ep, local: isLocalEndpoint(ep) });
       }
     })();
     return true;

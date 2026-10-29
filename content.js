@@ -19,7 +19,7 @@
   if (window.__wTranslateLoaded) return;
   window.__wTranslateLoaded = true;
 
-  const VERSION = '1.1.24';
+  const VERSION = '1.1.25';
   let enabled = true;
   const rowsByEl = new WeakMap();     // 文本元素 → 注入的译文行
   const clickTargets = new WeakMap(); // v1.1.22 点击翻译：文本元素 → {bubble, el, text, out}

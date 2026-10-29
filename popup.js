@@ -1,7 +1,38 @@
-/* popup.js — 设置页逻辑（v1.1.24：例句独立框 / 注入模式开关 / 折叠区默认收起各自记忆） */
+/* popup.js — 设置页逻辑（v1.1.25：端点自由增删，不再写死云端 / 本地 Strata 快捷填入） */
 
 const $ = (id) => document.getElementById(id);
 const FIELDS = ['apiBase', 'apiKey', 'model', 'temperature'];
+
+// ---------------- v1.1.25 端点常量 ----------------
+// 端点不再写死：新增配置时端点留空（由用户填），保存时规范化。
+// CLOUD_BASE 保留为「☁ 云端」快捷按钮与旧配置迁移的默认值；LOCAL_BASE 供「⚡ 本机 Strata」按钮。
+const CLOUD_BASE = 'https://api.scnet.cn/api/llm/v1';
+const LOCAL_BASE = 'http://192.168.2.153:8085';
+const DEFAULT_MODEL = 'Qwen3.8-Flash';
+
+// 端点规范化（与 background.js 同规则）：补 scheme / 补 /v1 / 去尾斜杠
+function normalizeEndpoint(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  s = s.replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(s)) {
+    const hostish = s.split('/')[0].split(':')[0];
+    const isLocal = /^(localhost$|\d{1,3}(\.\d{1,3}){3}$|\[.*\]$)/.test(hostish);
+    s = (isLocal ? 'http://' : 'https://') + s;
+  }
+  const m = s.match(/^(https?:\/\/[^/]+)(\/.*)?$/i);
+  if (m && !m[2]) return m[1] + '/v1';
+  return s;
+}
+// 本机/局域网端点？（UI 上标「本地」）
+function isLocalEndpoint(url) {
+  try {
+    const h = new URL(url).hostname;
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1'
+      || h.startsWith('192.168.') || h.startsWith('10.')
+      || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
+  } catch { return false; }
+}
 
 function setStatus(kind, text) {
   const el = $('status');
@@ -90,9 +121,10 @@ function normalizeProfiles(list) {
     .map((p) => ({
       id: String(p.id || newId()),
       name: String(p.name).trim().slice(0, 30),
-      apiBase: String(p.apiBase || 'https://api.scnet.cn/api/llm/v1').trim(),
+      // v1.1.25：端点不再回落云端——空就是空（用户自己填），保存时再规范化
+      apiBase: String(p.apiBase == null ? '' : p.apiBase).trim(),
       apiKey: String(p.apiKey || '').trim(),
-      model: String(p.model || 'Qwen3.8-Flash').trim(),
+      model: String(p.model || DEFAULT_MODEL).trim(),
       temperature: Number(p.temperature ?? 0.2),
     }));
 }
@@ -106,9 +138,11 @@ function commitFormToProfile() {
   const p = currentProfile();
   if (!p) return;
   p.name = $('pName').value.trim() || p.name || '未命名';
-  p.apiBase = $('apiBase').value.trim() || 'https://api.scnet.cn/api/llm/v1';
+  // v1.1.25：端点保存时规范化（补 scheme / 补 /v1 / 去尾斜杠）；空 → 云端默认
+  const ep = normalizeEndpoint($('apiBase').value);
+  p.apiBase = ep || CLOUD_BASE;
   p.apiKey = $('apiKey').value.trim();
-  p.model = $('model').value.trim() || 'Qwen3.8-Flash';
+  p.model = $('model').value.trim() || DEFAULT_MODEL;
   p.temperature = Math.min(2, Math.max(0, parseFloat($('temperature').value) || 0.2));
   // 名称唯一化：重名自动加序号，避免下拉框两条同名分不清
   const base = p.name;
@@ -138,9 +172,10 @@ function renderForm() {
   const p = currentProfile();
   if (!p) {
     $('pName').value = '默认配置';
-    $('apiBase').value = 'https://api.scnet.cn/api/llm/v1';
+    // v1.1.25：无配置时端点留空（不预填云端），用户自己填或点快捷按钮
+    $('apiBase').value = '';
     $('apiKey').value = '';
-    $('model').value = 'Qwen3.8-Flash';
+    $('model').value = DEFAULT_MODEL;
     $('temperature').value = 0.2;
     return;
   }
@@ -149,6 +184,7 @@ function renderForm() {
   $('apiKey').value = p.apiKey;
   $('model').value = p.model;
   $('temperature').value = p.temperature;
+  updateEndpointHint();
 }
 
 function renderProfileSelect() {
@@ -202,11 +238,11 @@ async function load() {
   }
 
   profiles = normalizeProfiles(cfg.profiles);
-  if (!profiles.length && (cfg.apiKey || cfg.model || (cfg.apiBase && cfg.apiBase !== 'https://api.scnet.cn/api/llm/v1'))) {
+  if (!profiles.length && (cfg.apiKey || cfg.model || (cfg.apiBase && cfg.apiBase !== CLOUD_BASE))) {
     // 旧版单配置迁移成第一条
     profiles = normalizeProfiles([{
       id: newId(), name: '默认配置',
-      apiBase: cfg.apiBase, apiKey: cfg.apiKey, model: cfg.model, temperature: cfg.temperature,
+      apiBase: cfg.apiBase || CLOUD_BASE, apiKey: cfg.apiKey, model: cfg.model, temperature: cfg.temperature,
     }]);
     activeId = profiles[0].id;
     await persistProfiles();
@@ -228,11 +264,23 @@ async function load() {
 // 「测试/诊断」用的临时 cfg：以当前表单为准，不写盘
 function gatherForm() {
   return {
-    apiBase: $('apiBase').value.trim() || 'https://api.scnet.cn/api/llm/v1',
+    // v1.1.25：端点不再回落云端——空就空，由后台 normalizeEndpoint 处理
+    apiBase: $('apiBase').value.trim(),
     apiKey: $('apiKey').value.trim(),
-    model: $('model').value.trim() || 'Qwen3.8-Flash',
+    model: $('model').value.trim() || DEFAULT_MODEL,
     temperature: Math.min(2, Math.max(0, parseFloat($('temperature').value) || 0.2)),
   };
+}
+
+// v1.1.25：端点输入框下方实时显示「规范化后的实际地址 + 本地/云端」
+function updateEndpointHint() {
+  const el = $('epHint');
+  if (!el) return;
+  const raw = $('apiBase').value.trim();
+  if (!raw) { el.textContent = ''; return; }
+  const ep = normalizeEndpoint(raw);
+  const tag = isLocalEndpoint(ep) ? '🖥 本机/局域网' : '☁ 云端';
+  el.innerHTML = `实际请求：<code>${ep}/chat/completions</code>　${tag}`;
 }
 
 $('save').addEventListener('click', async () => {
@@ -269,9 +317,10 @@ $('profileSel').addEventListener('change', async () => {
 $('addProfile').addEventListener('click', async () => {
   // v1.1.21 新增 = 复制当前配置「已保存」的值（不再把表单未保存改动回写到旧配置）
   const src = currentProfile();
+  // v1.1.25：无当前配置时新建一条「端点留空」的条目，由用户自己填（不再预填云端）
   const p = src
     ? { ...src, id: newId(), name: uniqueName(src.name) }
-    : { id: newId(), name: '新配置', apiBase: 'https://api.scnet.cn/api/llm/v1', apiKey: '', model: 'Qwen3.8-Flash', temperature: 0.2 };
+    : { id: newId(), name: '新配置', apiBase: '', apiKey: '', model: DEFAULT_MODEL, temperature: 0.2 };
   profiles.push(p);
   activeId = p.id;
   await persistProfiles();
@@ -279,7 +328,8 @@ $('addProfile').addEventListener('click', async () => {
   renderForm();
   $('pName').focus(); $('pName').select();
   let msg = '✔ 已新增「' + p.name + '」（复制自当前配置的已保存值），改参数后点「保存」';
-  if (src && isFormDirtyFor(src)) msg += '\n⚠ 注意：上一条有未保存的修改未被带过来（新增只复制已保存值）';
+  if (!src) msg = '✔ 已新增「' + p.name + '」。请填 API Base URL（可点「⚡ 本机 Strata」或「☁ 云端 scnet」），再点「保存」';
+  else if (isFormDirtyFor(src)) msg += '\n⚠ 注意：上一条有未保存的修改未被带过来（新增只复制已保存值）';
   setStatus('ok', msg);
 });
 
@@ -306,6 +356,19 @@ $('delProfile').addEventListener('click', async () => {
   renderProfileSelect();
   renderForm();
   setStatus('ok', '✔ 已删除配置「' + cur.name + '」');
+});
+
+// v1.1.25 端点输入实时提示 + 两个快捷填入按钮
+$('apiBase').addEventListener('input', updateEndpointHint);
+$('quickLocal').addEventListener('click', () => {
+  $('apiBase').value = LOCAL_BASE;
+  updateEndpointHint();
+  setStatus('ok', '✔ 已填入本机 Strata 端点。确认无误点「保存」生效；本地模型通常需要填 API Key。');
+});
+$('quickCloud').addEventListener('click', () => {
+  $('apiBase').value = CLOUD_BASE;
+  updateEndpointHint();
+  setStatus('ok', '✔ 已填入云端 scnet 端点。点「保存」生效。');
 });
 
 $('enabled').addEventListener('change', async () => {
@@ -372,10 +435,12 @@ $('test').addEventListener('click', async () => {
       setStatus('err', '✘ 后台不可用：' + chrome.runtime.lastError.message);
       return;
     }
+    // v1.1.25：显示实际端点 + 本地/云端 + 延迟
+    const ep = res?.endpoint ? `\n端点：${res.endpoint}/chat/completions　${res.local ? '🖥 本机/局域网' : '☁ 云端'}${res.ms != null ? `　延迟 ${res.ms}ms` : ''}` : '';
     if (res?.ok) {
-      setStatus('ok', '✔ 连接成功。样例输出：\n「你好，这批货明天发货」→ ' + res.sample);
+      setStatus('ok', '✔ 连接成功。样例输出：\n「你好，这批货明天发货」→ ' + res.sample + ep);
     } else {
-      setStatus('err', '✘ 失败：' + (res?.error || '未知错误'));
+      setStatus('err', '✘ 失败：' + (res?.error || '未知错误') + ep);
     }
   });
 });
@@ -412,7 +477,7 @@ $('exportLog').addEventListener('click', async () => {
   const lines = await fetchLog();
   if (!lines.length) { setStatus('err', '✘ 日志为空。\n在 WhatsApp 页点几条消息翻译后再来导出。'); return; }
   const text = lines.map((l) => `[${fmtLogTs(l.t)}] ${l.lv}: ${l.m}${l.d ? ' | ' + l.d : ''}`).join('\n');
-  const head = `WhatsApp翻译插件日志 v1.1.24　${lines.length} 条　导出时间 ${fmtLogTs(Date.now())}\n${'='.repeat(46)}\n`;
+  const head = `WhatsApp翻译插件日志 v1.1.25　${lines.length} 条　导出时间 ${fmtLogTs(Date.now())}\n${'='.repeat(46)}\n`;
   try {
     await navigator.clipboard.writeText(head + text);
     setStatus('ok', '✔ 日志（' + lines.length + ' 条）已复制到剪贴板，直接粘贴发给开发者即可');
