@@ -1,4 +1,4 @@
-/* popup.js — 设置页逻辑（v1.1.25：端点自由增删，不再写死云端） */
+/* popup.js — 设置页逻辑（v1.1.26：端点自由增删，不再写死云端） */
 
 const $ = (id) => document.getElementById(id);
 const FIELDS = ['apiBase', 'apiKey', 'model', 'temperature'];
@@ -171,7 +171,7 @@ function renderForm() {
   const p = currentProfile();
   if (!p) {
     $('pName').value = '默认配置';
-    // v1.1.25：无配置时端点留空（不预填云端），用户自己填或点快捷按钮
+    // v1.1.25：无配置时端点留空（不预填云端），用户自己填
     $('apiBase').value = '';
     $('apiKey').value = '';
     $('model').value = DEFAULT_MODEL;
@@ -466,7 +466,7 @@ $('exportLog').addEventListener('click', async () => {
   const lines = await fetchLog();
   if (!lines.length) { setStatus('err', '✘ 日志为空。\n在 WhatsApp 页点几条消息翻译后再来导出。'); return; }
   const text = lines.map((l) => `[${fmtLogTs(l.t)}] ${l.lv}: ${l.m}${l.d ? ' | ' + l.d : ''}`).join('\n');
-  const head = `WhatsApp翻译插件日志 v1.1.25　${lines.length} 条　导出时间 ${fmtLogTs(Date.now())}\n${'='.repeat(46)}\n`;
+  const head = `WhatsApp翻译插件日志 v1.1.26　${lines.length} 条　导出时间 ${fmtLogTs(Date.now())}\n${'='.repeat(46)}\n`;
   try {
     await navigator.clipboard.writeText(head + text);
     setStatus('ok', '✔ 日志（' + lines.length + ' 条）已复制到剪贴板，直接粘贴发给开发者即可');

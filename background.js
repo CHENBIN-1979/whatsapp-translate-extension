@@ -22,6 +22,8 @@
  *          绕过 CORS，故服务端无需配 cors_origins，任意本地 IP 都能直连）。
  *          极速模式同时发 chat_template_kwargs.enable_thinking（本地推理模型只认这个，
  *          实测 38.0s → 0.3s）；本地端点单条超时 25s → 90s。
+ * v1.1.26：版本号前进（v1.1.25 曾原地修正 tag 指向两个 commit，历史不干净）；
+ *          功能同 v1.1.25（弹窗已移除「本机 Strata」「云端 scnet」两个快捷按钮）。
  */
 const DEFAULTS = {
   apiBase: 'https://api.scnet.cn/api/llm/v1',
