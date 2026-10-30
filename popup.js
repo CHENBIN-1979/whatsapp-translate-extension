@@ -1,13 +1,12 @@
-/* popup.js — 设置页逻辑（v1.1.25：端点自由增删，不再写死云端 / 本地 Strata 快捷填入） */
+/* popup.js — 设置页逻辑（v1.1.25：端点自由增删，不再写死云端） */
 
 const $ = (id) => document.getElementById(id);
 const FIELDS = ['apiBase', 'apiKey', 'model', 'temperature'];
 
 // ---------------- v1.1.25 端点常量 ----------------
 // 端点不再写死：新增配置时端点留空（由用户填），保存时规范化。
-// CLOUD_BASE 保留为「☁ 云端」快捷按钮与旧配置迁移的默认值；LOCAL_BASE 供「⚡ 本机 Strata」按钮。
+// CLOUD_BASE 供旧配置迁移与端点留空时的默认值。
 const CLOUD_BASE = 'https://api.scnet.cn/api/llm/v1';
-const LOCAL_BASE = 'http://192.168.2.153:8085';
 const DEFAULT_MODEL = 'Qwen3.8-Flash';
 
 // 端点规范化（与 background.js 同规则）：补 scheme / 补 /v1 / 去尾斜杠
@@ -358,18 +357,8 @@ $('delProfile').addEventListener('click', async () => {
   setStatus('ok', '✔ 已删除配置「' + cur.name + '」');
 });
 
-// v1.1.25 端点输入实时提示 + 两个快捷填入按钮
+// v1.1.25 端点输入实时提示（规范化后的实际地址 + 本地/云端标记）
 $('apiBase').addEventListener('input', updateEndpointHint);
-$('quickLocal').addEventListener('click', () => {
-  $('apiBase').value = LOCAL_BASE;
-  updateEndpointHint();
-  setStatus('ok', '✔ 已填入本机 Strata 端点。确认无误点「保存」生效；本地模型通常需要填 API Key。');
-});
-$('quickCloud').addEventListener('click', () => {
-  $('apiBase').value = CLOUD_BASE;
-  updateEndpointHint();
-  setStatus('ok', '✔ 已填入云端 scnet 端点。点「保存」生效。');
-});
 
 $('enabled').addEventListener('change', async () => {
   await chrome.storage.local.set({ enabled: $('enabled').checked });
