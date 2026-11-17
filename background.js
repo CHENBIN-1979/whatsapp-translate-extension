@@ -24,6 +24,13 @@
  *          实测 38.0s → 0.3s）；本地端点单条超时 25s → 90s。
  * v1.1.26：版本号前进（v1.1.25 曾原地修正 tag 指向两个 commit，历史不干净）；
  *          功能同 v1.1.25（弹窗已移除「本机 Strata」「云端 scnet」两个快捷按钮）。
+ * v1.1.27：修复「中文夹英文名/机台号的句子翻不出来」（用户日志实锤：DARIMINTO 立即查看…
+ *          被模型整句当专名原样返回，删掉 DARIMINTO 才译得出）。①系统提示词加硬规则：
+ *          句中夹带的英文/拼音人名或机台号只是一个词，其余内容必须正常翻译，不得因句中有
+ *          英文字母/数字就整句原样返回。②回显智能重试：检测到回显且 hasTranslatableBody
+ *          为真（中→印尼：去拉丁后≥4 汉字；印尼→中：≥4 个字母词）时，用 retryEchoTranslate
+ *          单句强提示词重试 1 次；成功则返回译文，仍回显才落「专有名词」灰字标注。纯人名
+ *          （Adyanto Setiaji）/纯号码（0895392493636 siswanto）不触发重试，计费不变。
  */
 const DEFAULTS = {
   apiBase: 'https://api.scnet.cn/api/llm/v1',
@@ -479,6 +486,7 @@ const SYSTEM_PROMPT = [
   '保持口语化，保留表情符号、数字、@ 提及原样。',
   '必须逐行翻译：原文每一行（含换行符\\n分隔的行）都要翻译并在译文中保留同样的换行，不得合并、省略或重排任何一行。',
   '专有名词处理：产品型号、编号、代码、缩写保留原文；印尼语人名尽量用常见汉字音译（如 Adyanto→阿迪扬托、Setiaji→斯迪亚吉），人名后可括号保留原文；不要把整条消息原样返回。',
+  '混合文字消息：一句话里夹带的英文/拼音人名或机台号（如「DARIMINTO 立即查看是否可以现在修复」「Mr.Chen 已经检查过」）只是句中的一个词——只保留该人名/编号原样，其余内容必须正常翻译；绝不能因为句中有英文字母或数字就把整句原样返回。',
   '输出：只输出一个 JSON 字符串数组，长度、顺序与输入完全一致。不要输出任何其他文字。',
 ].join('\n');
 
@@ -526,6 +534,37 @@ function looksLikeEcho(src, val) {
   return normEcho(s) === normEcho(v);
 }
 const ECHO_MSG = '模型返回了原文（未翻译）'; // v1.1.24：不再当失败抛错，仅保留给旧测试桩引用
+
+// v1.1.27：句中夹英文名/机台号被模型整句当专名原样返回时，判断是否「其实还有正文待译」。
+// 纯人名（Adyanto Setiaji=2 词）/ 纯号码（0895392493636 siswanto=号码+1 词）不触发重试，
+// 避免给本来就无需翻译的专名多计费；含成规模正文的混合句才重试。
+function hasTranslatableBody(text) {
+  const s = String(text || '');
+  if (detectTarget(s) === 'id') {
+    // 源含中文→译印尼：去掉拉丁/数字后还有 ≥4 个汉字 = 确有正文（纯中文名极少 ≥4 字）
+    return (s.match(/[\u4e00-\u9fff]/g) || []).length >= 4;
+  }
+  // 源为印尼/英文→译中：≥4 个长度≥2 的字母词才算正文（纯人名/号码不算）
+  return (s.match(/[A-Za-z]{2,}/g) || []).length >= 4;
+}
+
+// v1.1.27：回显强化重试。用单句强提示词再要一次——明确「人名/编号保留，其余必须译出，
+// 不得整句原样返回」。只在 hasTranslatableBody 为真时调用（专名不重试）。
+async function retryEchoTranslate(cfg, text, dict = normDict(cfg.customDict), ex = normDictEx(cfg.customDictEx)) {
+  const target = detectTarget(text);
+  const targetName = target === 'id' ? '印尼语' : '简体中文';
+  const sys = '你是翻译器。把用户给你的消息翻译成' + targetName + '。'
+    + '这条消息里夹着的英文/拼音人名或机台号（如 DARIMINTO、Mr.Chen、A008）只保留原样，'
+    + '其余内容【必须】翻译成' + targetName + '，绝不能整句原样返回。'
+    + '只输出译文本身，不要解释、引号或前缀。保留换行和表情符号。'
+    + (dictLines(dict) ? '术语表（这些术语必须按指定译文翻译）：' + (target === 'id' ? dictLinesRev(dict) : dictLines(dict)) : '');
+  const timeoutMs = isLocalEndpoint(normalizeEndpoint(cfg.apiBase)) ? 90000 : 25000;
+  const content = await chatCompletion(cfg, [
+    { role: 'system', content: sys },
+    { role: 'user', content: text },
+  ], timeoutMs, Math.min(4096, 100 + Math.ceil(text.length * 3)));
+  return content.trim();
+}
 
 const MAX_TEXT_LEN = 4000;   // 单条上限
 const MAX_BATCH_ITEMS = 12;  // 一批最多条数（过多模型容易漏条/截断）
@@ -613,17 +652,38 @@ async function flush() {
     try {
       const results = await translateBatch(cfg, batch.map((b) => b.sent), bDict, bEx);
       logLine('api', `批量 ${batch.length} 条 ok ${Date.now() - t0}ms 词条${bDict.size}`);
+      // v1.1.27：先收集回显且确有正文待译的条目（句中夹英文名被整句当专名），并行强化重试；
+      // 其余（正常译文 / 纯专名回显）直接 resolve。
+      const echoRetry = [];
       batch.forEach((b, idx) => {
         const rawVal = String(results[idx] ?? '').trim();
         const srcZh1 = detectTarget(b.sent) === 'id';
         const val = enforceDictOut(applyDictOut(rawVal, dict, srcZh1), dict, b.sent, srcZh1) || '⚠ 无译文';
-        // v1.1.24 回显=专有名词保留原文：正常缓存并返回（content 端加标注），不再 reject。
-        // 旧版当失败→不缓存→用户再点再计费（日志实测同一条人名点了 4 次计 4 次费）。
+        if (looksLikeEcho(b.sent, val) && hasTranslatableBody(b.sent)) { echoRetry.push(b); return; }
         if (looksLikeEcho(b.sent, val)) logLine('note', `保留原文(专名): "${b.sent.slice(0, 40)}"`);
         c.set(b.key, val);
         scheduleSaveCache();
         b.resolve(val);
       });
+      await Promise.all(echoRetry.map(async (b) => {
+        const srcZh = detectTarget(b.sent) === 'id';
+        const rDict = mode === 'auto' ? matchDictFor(mode, dict, b.sent) : dict;
+        try {
+          const raw = await retryEchoTranslate(cfg, b.sent, rDict);
+          const val = enforceDictOut(applyDictOut(raw, dict, srcZh), dict, b.sent, srcZh) || '⚠ 无译文';
+          if (looksLikeEcho(b.sent, val)) {
+            logLine('note', `保留原文(专名,重试仍回显): "${b.sent.slice(0, 40)}"`);
+          } else {
+            logLine('api', `回显重试成功(混合句已译): "${b.sent.slice(0, 40)}"`);
+          }
+          c.set(b.key, val); scheduleSaveCache(); b.resolve(val);
+        } catch (e) {
+          // 重试失败：退回原回显结果（专名保留语义），不报失败
+          logLine('note', `保留原文(专名): "${b.sent.slice(0, 40)}"（重试失败）`);
+          const val = enforceDictOut(applyDictOut(b.sent, dict, srcZh), dict, b.sent, srcZh) || b.sent;
+          c.set(b.key, val); scheduleSaveCache(); b.resolve(val);
+        }
+      }));
     } catch (err) {
       // 批量失败 → 逐条降级。必须并行：串行 N 条 × 超时 = 全挂十几分钟，
       // 译文行会一直显示「翻译中…」（用户实测 16 条卡死即此因）。
@@ -640,8 +700,24 @@ async function flush() {
             const t1 = Date.now();
             const raw2 = await translateSingle(cfg, sent2, sDict, sEx);
             logLine('api', `单条 ok ${Date.now() - t1}ms 词条${sDict.size} "${sent2.slice(0, 40)}"`);
-            const val = enforceDictOut(applyDictOut(raw2, dict, srcZh2), dict, sent2, srcZh2);
-            if (looksLikeEcho(sent2, val)) logLine('note', `保留原文(专名): "${sent2.slice(0, 40)}"`); // v1.1.24
+            let val = enforceDictOut(applyDictOut(raw2, dict, srcZh2), dict, sent2, srcZh2);
+            // v1.1.27：单条路径同样处理「混合句被整句当专名回显」→ 强化重试一次
+            if (looksLikeEcho(sent2, val) && hasTranslatableBody(sent2)) {
+              try {
+                const raw3 = await retryEchoTranslate(cfg, sent2, sDict);
+                const val3 = enforceDictOut(applyDictOut(raw3, dict, srcZh2), dict, sent2, srcZh2);
+                if (!looksLikeEcho(sent2, val3)) {
+                  logLine('api', `回显重试成功(混合句已译): "${sent2.slice(0, 40)}"`);
+                  val = val3;
+                } else {
+                  logLine('note', `保留原文(专名,重试仍回显): "${sent2.slice(0, 40)}"`);
+                }
+              } catch (e) {
+                logLine('note', `保留原文(专名): "${sent2.slice(0, 40)}"（重试失败）`);
+              }
+            } else if (looksLikeEcho(sent2, val)) {
+              logLine('note', `保留原文(专名): "${sent2.slice(0, 40)}"`); // v1.1.24
+            }
             c.set(b.key, val);
             scheduleSaveCache();
             b.resolve(val);

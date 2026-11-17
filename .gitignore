@@ -1,3 +1,6 @@
 # 构建产物与打包交付物（本地保留，不入库）
 *.zip
 whatsapp-translate-extension/
+node_modules/
+publish_release*.py
+republish_release.py
